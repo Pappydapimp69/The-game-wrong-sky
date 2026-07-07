@@ -1,0 +1,10 @@
+{
+  "name": "the-game-wrong-sky",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Wrong Sky — game 2 of the saga. Sequel to the Prologue; a full gameplay phase with GRIS-style progressive visual unlocks layered on real progression. Vanilla JS + canvas, zero dependencies.",
+  "scripts": {
+    "smoke": "node scripts/smoke.mjs"
+  }
+}
