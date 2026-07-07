@@ -32,6 +32,12 @@ export function startGame(canvas, seed, options = {}, initialWorld = null) {
   let world = initialWorld || makeWorld(seed, options);
   let ro = readonly(world);
   if (world.flags.audio) audio.enable(); // a resumed save that already had sound on
+  // The run's exact restart point for "Rise Again". Snapshotting the actual
+  // starting world (not re-running makeWorld with the caller's options) keeps
+  // the right archetype, difficulty, seed, carried skills, and RNG on death —
+  // a CONTINUE passes empty options, so makeWorld would otherwise resurrect a
+  // default Brawler.
+  let respawn = JSON.stringify(world);
   const view = {
     px: world.player.x, py: world.player.y,
     toasts: [], modal: null, dodging: false, device: 'keyboard',
@@ -62,7 +68,11 @@ export function startGame(canvas, seed, options = {}, initialWorld = null) {
   function dispatch(cmd) {
     const events = reduce(world, cmd);
     for (const e of events) onEvent(e);
-    if (!world.flags.ended) saveGame(world);
+    // Never persist a dead or finished state: a hp-0 save resumes as a "zombie"
+    // that walks around until the next strike re-opens the defeat modal. The
+    // last good save (just before the fatal blow) is what a mid-death resume
+    // gets instead.
+    if (!world.flags.ended && world.player.hp > 0) saveGame(world);
     return events;
   }
 
@@ -205,7 +215,7 @@ export function startGame(canvas, seed, options = {}, initialWorld = null) {
     if (presses.confirm || (m.kind !== 'shop' && presses.interact)) {
       if (m.kind === 'offer') { dispatch({ type: 'ACCEPT_QUEST', questId: m.quest }); closeModal(); toast('Quest accepted'); }
       else if (m.kind === 'shop') { dispatch({ type: 'BUY', itemId: m.itemId }); }
-      else if (m.kind === 'defeat') { world = makeWorld(seed, options); ro = readonly(world); closeModal(); toast('A new dawn'); }
+      else if (m.kind === 'defeat') { world = JSON.parse(respawn); ro = readonly(world); saveGame(world); closeModal(); toast('You rise where you began.'); }
       else if (m.kind === 'fate') { dispatch({ type: 'CHOOSE_FATE', fate: 'spare' }); closeModal(); toast('You let it live. It watches you go.'); }
       else if (m.kind === 'finale') { if (navigator.clipboard?.writeText) navigator.clipboard.writeText(m.code).catch(() => {}); toast('Code copied. See you in Part III.'); }
       else closeModal();

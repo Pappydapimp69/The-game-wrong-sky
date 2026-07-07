@@ -197,8 +197,17 @@ export function render(ctx, w, view) {
     for (const [x, y] of walls) drawWall(x, y);
   }
 
-  // --- HUD (screen space, its own scale) -----------------------------------
+  // Dusk/night: the integer world clock raises enemy aggression (daynight.js);
+  // a faint screen-space tint so that pressure reads visually. Light-restored
+  // scenes are already dark, so ease it down there. Drawn over the world but
+  // under the HUD (which follows), so text stays readable.
   ctx.setTransform(1, 0, 0, 1, 0, 0);
+  if (view.night > 0.05) {
+    ctx.fillStyle = `rgba(8,12,34,${(view.night * (vis.light ? 0.16 : 0.34)).toFixed(3)})`;
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  // --- HUD (screen space, its own scale) -----------------------------------
   const u = clamp(H / 540, 0.85, 3); // ui scale — anchored to height, NOT world scale
   ctx.textAlign = 'left';
   const pad2 = 12 * u;
@@ -323,8 +332,13 @@ function drawLight(ctx, W, H, scale, camX, camY, view, sources) {
     lc.beginPath(); lc.arc(sx, sy, r, 0, Math.PI * 2); lc.fill();
   }
   lc.globalCompositeOperation = 'source-over';
+  // Blit in screen space, but SAVE/RESTORE so the caller's world transform is
+  // intact afterward — the caller redraws the wall occluders in world coords
+  // right after this returns.
+  ctx.save();
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.drawImage(lightLayer, 0, 0);
+  ctx.restore();
 }
 
 // --- modal ------------------------------------------------------------------
