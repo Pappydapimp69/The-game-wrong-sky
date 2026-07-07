@@ -5,17 +5,19 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
   <title>Wrong Sky</title>
   <style>
-    html, body { margin: 0; height: 100%; background: #05070f; display: grid; place-items: center; }
-    canvas { max-width: 100%; height: auto; image-rendering: pixelated; }
+    html, body { margin: 0; height: 100%; overflow: hidden; background: #05070f; }
+    /* Fill the whole field of view — the JS sizes the backing store to the
+       viewport (× DPR); CSS just stretches it edge to edge. */
+    #game { display: block; width: 100vw; height: 100vh; touch-action: none; }
   </style>
 </head>
 <body>
-  <canvas id="game" width="640" height="360"></canvas>
-  <!-- Cache-buster: bump this string by hand on any deploy that must be
-       visible immediately. NOTE (Brain: the-game-prologue#E8) — this busts
-       ONLY the entry file, not its nested relative imports (each a separate
-       cache entry). No build step here to rewrite every specifier, so this is
-       a known partial mitigation, not a full fix. -->
+  <canvas id="game"></canvas>
+  <!-- Cache-buster: bump this string by hand on any deploy that must be visible
+       immediately. NOTE (Brain: the-game-prologue#E8) — this busts ONLY the
+       entry file, not its nested relative imports (each a separate cache entry).
+       No build step here to rewrite every specifier, so this is a known partial
+       mitigation, not a full fix. -->
   <script type="module" src="src/main.js?v=20260707-1"></script>
 </body>
 </html>
