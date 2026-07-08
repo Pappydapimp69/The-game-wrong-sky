@@ -40,6 +40,22 @@ export const COLORS = {
 const GRAY = {};
 for (const [k, hex] of Object.entries(COLORS)) GRAY[k] = toGray(hex);
 
+// Offscreen world-layer buffer: every ground/wall/entity/projectile draw goes
+// here UNFILTERED, then the whole buffer is composited onto the visible
+// canvas with the grayscale/kaleidoscope filter applied ONCE. Canvas 2D
+// `ctx.filter` is expensive per call — applying it individually to every
+// tile and entity (hundreds of drawImage calls a frame once `world`/`enemies`
+// sprites are on) caused multi-second frame stalls; one filtered blit of a
+// pre-composited layer is the same visual result for a fraction of the cost.
+let worldLayer = null;
+function getWorldLayer(w, h) {
+  if (!worldLayer || worldLayer.width !== w || worldLayer.height !== h) {
+    worldLayer = document.createElement('canvas');
+    worldLayer.width = w; worldLayer.height = h;
+  }
+  return worldLayer;
+}
+
 // Sprite render filter for the current frame: grayscale until the light well
 // fires, then a ~7s hue-cycle melt into true color, then NONE forever after
 // (a resumed save where light was already attuned in a prior session also
@@ -55,10 +71,41 @@ function spriteFilter(view, now, lightRestored) {
   return lightRestored ? 'none' : 'grayscale(1)';
 }
 
-// Canvas 2D `filter` treats 'none' as an exclusive keyword — it cannot be
-// combined with other filter functions in one string ('none grayscale(...)'
-// is invalid and silently drops the whole filter). Combine safely instead.
-function combineFilter(base, extra) { return base === 'none' ? extra : `${base} ${extra}`; }
+// Charge-only DBZ-style flame overlay (replaces the old always-on aura ring
+// once the player sprite is unlocked). Full opacity while charging; on
+// release it fades over a duration set by game.js from the aura-% spec
+// (below 80% -> 100ms; 80-100% -> scales 200ms to 500ms).
+function auraFlameAlpha(view, now) {
+  if (view.charging) return 1;
+  if (view.auraFadeActive) {
+    const elapsed = now - view.auraFadeStart;
+    if (elapsed < view.auraFadeDuration) return Math.max(0, 1 - elapsed / view.auraFadeDuration);
+  }
+  return 0;
+}
+function drawAuraFlame(ctx, cx, topY, alpha, now) {
+  const t = now * 0.006;
+  const flicker = Math.sin(t) * 2;
+  const flicker2 = Math.sin(t * 1.7 + 1) * 1.5;
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  const grad = ctx.createLinearGradient(0, topY, 0, topY - TILE * 0.9);
+  grad.addColorStop(0, 'rgba(126,200,255,0.9)');
+  grad.addColorStop(1, 'rgba(126,200,255,0)');
+  ctx.fillStyle = grad;
+  drawLick(ctx, cx - 4 + flicker * 0.4, topY, TILE * 0.22, TILE * 0.55);
+  drawLick(ctx, cx + flicker, topY, TILE * 0.28, TILE * 0.75);
+  drawLick(ctx, cx + 4 + flicker2 * 0.4, topY, TILE * 0.2, TILE * 0.5);
+  ctx.restore();
+}
+function drawLick(ctx, x, baseY, width, height) {
+  ctx.beginPath();
+  ctx.moveTo(x - width / 2, baseY);
+  ctx.quadraticCurveTo(x - width * 0.6, baseY - height * 0.5, x, baseY - height);
+  ctx.quadraticCurveTo(x + width * 0.6, baseY - height * 0.5, x + width / 2, baseY);
+  ctx.closePath();
+  ctx.fill();
+}
 
 export function render(ctx, w, view, now = 0) {
   const { canvas } = ctx;
@@ -82,7 +129,17 @@ export function render(ctx, w, view, now = 0) {
   const centerX = view.px * TILE + TILE / 2, centerY = view.py * TILE + TILE / 2;
   const camX = clampCam(centerX - viewWpx / 2, regionWpx, viewWpx);
   const camY = clampCam(centerY - viewHpx / 2, regionHpx, viewHpx);
-  ctx.setTransform(scale, 0, 0, scale, -camX * scale + (view.shakeX || 0), -camY * scale + (view.shakeY || 0));
+  const camTransform = [scale, 0, 0, scale, -camX * scale + (view.shakeX || 0), -camY * scale + (view.shakeY || 0)];
+
+  // All ground/wall/entity/projectile drawing below targets the offscreen
+  // world layer, UNFILTERED — the grayscale/kaleidoscope filter is applied
+  // ONCE at composite time instead of once per drawImage call (see
+  // getWorldLayer above: per-call ctx.filter is a severe Canvas 2D perf trap).
+  const layerCanvas = getWorldLayer(W, H);
+  const wctx = layerCanvas.getContext('2d');
+  wctx.setTransform(1, 0, 0, 1, 0, 0);
+  wctx.clearRect(0, 0, W, H);
+  wctx.setTransform(...camTransform);
 
   const pad = 1;
   const minTX = Math.max(0, Math.floor(camX / TILE) - pad);
@@ -97,26 +154,30 @@ export function render(ctx, w, view, now = 0) {
     for (let ty = minTY; ty <= maxTY; ty++) {
       for (let tx = minTX; tx <= maxTX; tx++) {
         const def = (tx + ty) % 2 === 0 ? TILE_SPRITES.groundA : TILE_SPRITES.groundB;
-        drawPixelSprite(ctx, def, tx * TILE, ty * TILE, TILE, filter);
+        drawPixelSprite(wctx, def, tx * TILE, ty * TILE, TILE, 'none');
       }
     }
   } else {
-    ctx.fillStyle = C.ground;
-    ctx.fillRect(minTX * TILE, minTY * TILE, (maxTX - minTX + 1) * TILE, (maxTY - minTY + 1) * TILE);
-    ctx.strokeStyle = C.grid;
-    ctx.lineWidth = 1;
-    for (let x = minTX; x <= maxTX + 1; x++) { ctx.beginPath(); ctx.moveTo(x * TILE, minTY * TILE); ctx.lineTo(x * TILE, (maxTY + 1) * TILE); ctx.stroke(); }
-    for (let y = minTY; y <= maxTY + 1; y++) { ctx.beginPath(); ctx.moveTo(minTX * TILE, y * TILE); ctx.lineTo((maxTX + 1) * TILE, y * TILE); ctx.stroke(); }
+    wctx.fillStyle = C.ground;
+    wctx.fillRect(minTX * TILE, minTY * TILE, (maxTX - minTX + 1) * TILE, (maxTY - minTY + 1) * TILE);
+    wctx.strokeStyle = C.grid;
+    wctx.lineWidth = 1;
+    for (let x = minTX; x <= maxTX + 1; x++) { wctx.beginPath(); wctx.moveTo(x * TILE, minTY * TILE); wctx.lineTo(x * TILE, (maxTY + 1) * TILE); wctx.stroke(); }
+    for (let y = minTY; y <= maxTY + 1; y++) { wctx.beginPath(); wctx.moveTo(minTX * TILE, y * TILE); wctx.lineTo((maxTX + 1) * TILE, y * TILE); wctx.stroke(); }
   }
 
-  const drawWall = (x, y) => {
-    if (worldSprites) drawPixelSprite(ctx, TILE_SPRITES.wall, x * TILE, y * TILE, TILE, filter);
-    else { ctx.fillStyle = C.wall; ctx.fillRect(x * TILE, y * TILE, TILE, TILE); }
+  // Takes an explicit target + filter so the same wall art can be drawn
+  // unfiltered onto the world layer, then redrawn (filtered, only a handful
+  // of on-screen tiles) directly on the visible canvas after the shadow
+  // overlay — that redraw was never the performance bottleneck.
+  const drawWallTo = (targetCtx, f, x, y) => {
+    if (worldSprites) drawPixelSprite(targetCtx, TILE_SPRITES.wall, x * TILE, y * TILE, TILE, f);
+    else { targetCtx.fillStyle = C.wall; targetCtx.fillRect(x * TILE, y * TILE, TILE, TILE); }
   };
   const walls = [];
   for (const key of Object.keys(w.region.blocked)) {
     const [x, y] = key.split(',').map(Number);
-    if (onScreen(x, y)) { walls.push([x, y]); drawWall(x, y); }
+    if (onScreen(x, y)) { walls.push([x, y]); drawWallTo(wctx, 'none', x, y); }
   }
 
   // --- build the drawable list (entities) ---
@@ -127,8 +188,8 @@ export function render(ctx, w, view, now = 0) {
     const d = w.destructibles[id];
     add(d.x, d.y, () => {
       const [x, y] = tile(d.x, d.y);
-      if (d.broken) { ctx.strokeStyle = C.crate; ctx.strokeRect(x + 6, y + 6, TILE - 12, TILE - 12); }
-      else { ctx.fillStyle = C.crate; fillSquashed(ctx, x + 4, y + 4, TILE - 8, TILE - 8, view.punch[id] || 0); }
+      if (d.broken) { wctx.strokeStyle = C.crate; wctx.strokeRect(x + 6, y + 6, TILE - 12, TILE - 12); }
+      else { wctx.fillStyle = C.crate; fillSquashed(wctx, x + 4, y + 4, TILE - 8, TILE - 8, view.punch[id] || 0); }
     });
   }
   for (const id of Object.keys(w.pickups)) {
@@ -136,11 +197,11 @@ export function render(ctx, w, view, now = 0) {
     if (p.taken) continue;
     add(p.x, p.y, () => {
       const [x, y] = tile(p.x, p.y);
-      ctx.fillStyle = C.pickup;
-      ctx.beginPath();
-      ctx.moveTo(x + TILE / 2, y + 5); ctx.lineTo(x + TILE - 5, y + TILE / 2);
-      ctx.lineTo(x + TILE / 2, y + TILE - 5); ctx.lineTo(x + 5, y + TILE / 2);
-      ctx.closePath(); ctx.fill();
+      wctx.fillStyle = C.pickup;
+      wctx.beginPath();
+      wctx.moveTo(x + TILE / 2, y + 5); wctx.lineTo(x + TILE - 5, y + TILE / 2);
+      wctx.lineTo(x + TILE / 2, y + TILE - 5); wctx.lineTo(x + 5, y + TILE / 2);
+      wctx.closePath(); wctx.fill();
     });
   }
   for (const id of Object.keys(w.wells)) {
@@ -148,11 +209,11 @@ export function render(ctx, w, view, now = 0) {
     add(wl.x, wl.y, () => {
       const [x, y] = tile(wl.x, wl.y);
       const cx = x + TILE / 2, cy = y + TILE / 2;
-      ctx.strokeStyle = wl.attuned ? C.wellOn : C.well;
-      ctx.lineWidth = wl.attuned ? 3 : 2;
-      ctx.beginPath(); ctx.arc(cx, cy, TILE * 0.34, 0, Math.PI * 2); ctx.stroke();
-      if (wl.attuned) { ctx.fillStyle = C.wellOn; ctx.beginPath(); ctx.arc(cx, cy, TILE * 0.16, 0, Math.PI * 2); ctx.fill(); }
-      ctx.lineWidth = 1;
+      wctx.strokeStyle = wl.attuned ? C.wellOn : C.well;
+      wctx.lineWidth = wl.attuned ? 3 : 2;
+      wctx.beginPath(); wctx.arc(cx, cy, TILE * 0.34, 0, Math.PI * 2); wctx.stroke();
+      if (wl.attuned) { wctx.fillStyle = C.wellOn; wctx.beginPath(); wctx.arc(cx, cy, TILE * 0.16, 0, Math.PI * 2); wctx.fill(); }
+      wctx.lineWidth = 1;
     });
   }
   const enemySprites = vis.enemies;
@@ -161,16 +222,16 @@ export function render(ctx, w, view, now = 0) {
     add(n.x, n.y, () => {
       const [x, y] = tile(n.x, n.y);
       if (enemySprites) {
-        drawPixelSprite(ctx, PLAYER_SPRITES['down-0'], x + 2, y + 2, TILE - 4, combineFilter(filter, 'grayscale(0.6) brightness(0.85)'));
+        drawPixelSprite(wctx, PLAYER_SPRITES['down-0'], x + 2, y + 2, TILE - 4, 'grayscale(0.6) brightness(0.85)');
       } else {
-        ctx.fillStyle = C.npc;
-        ctx.fillRect(x + 5, y + 4, TILE - 10, TILE - 7);
+        wctx.fillStyle = C.npc;
+        wctx.fillRect(x + 5, y + 4, TILE - 10, TILE - 7);
       }
-      ctx.fillStyle = C.dim;
-      ctx.font = '9px system-ui, sans-serif';
-      ctx.textAlign = 'center';
-      ctx.fillText(n.name, x + TILE / 2, y - 3);
-      ctx.textAlign = 'left';
+      wctx.fillStyle = C.dim;
+      wctx.font = '9px system-ui, sans-serif';
+      wctx.textAlign = 'center';
+      wctx.fillText(n.name, x + TILE / 2, y - 3);
+      wctx.textAlign = 'left';
     });
   }
   for (const id of Object.keys(w.enemies)) {
@@ -180,49 +241,54 @@ export function render(ctx, w, view, now = 0) {
       const [x, y] = tile(e.x, e.y);
       const big = isBoss ? 5 : 0;
       if (enemySprites && ENEMY_SPRITES[e.kind]) {
-        const f = e.alive ? filter : 'grayscale(1) brightness(0.4)';
-        drawPixelSprite(ctx, ENEMY_SPRITES[e.kind], x + 2 - big, y + 2 - big, TILE - 4 + big * 2, f);
+        const f = e.alive ? 'none' : 'grayscale(1) brightness(0.4)';
+        drawPixelSprite(wctx, ENEMY_SPRITES[e.kind], x + 2 - big, y + 2 - big, TILE - 4 + big * 2, f);
       } else {
-        ctx.fillStyle = !e.alive ? C.dead : (isBoss ? C.rival : C.enemy);
-        fillSquashed(ctx, x + 5 - big, y + 5 - big, TILE - 10 + big * 2, TILE - 10 + big * 2, view.punch[id] || 0);
+        wctx.fillStyle = !e.alive ? C.dead : (isBoss ? C.rival : C.enemy);
+        fillSquashed(wctx, x + 5 - big, y + 5 - big, TILE - 10 + big * 2, TILE - 10 + big * 2, view.punch[id] || 0);
       }
       if (e.alive) {
         if (canSense(w.player, e.kind)) {
-          ctx.fillStyle = C.bar; ctx.fillRect(x + 3, y - 6, TILE - 6, 3);
-          ctx.fillStyle = C.hp; ctx.fillRect(x + 3, y - 6, (TILE - 6) * (e.hp / e.maxHp), 3);
+          wctx.fillStyle = C.bar; wctx.fillRect(x + 3, y - 6, TILE - 6, 3);
+          wctx.fillStyle = C.hp; wctx.fillRect(x + 3, y - 6, (TILE - 6) * (e.hp / e.maxHp), 3);
         }
-        ctx.fillStyle = C.dim; ctx.font = '8px system-ui, sans-serif'; ctx.textAlign = 'center';
-        ctx.fillText(enemyReadout(w.player, e), x + TILE / 2, y - 9); ctx.textAlign = 'left';
+        wctx.fillStyle = C.dim; wctx.font = '8px system-ui, sans-serif'; wctx.textAlign = 'center';
+        wctx.fillText(enemyReadout(w.player, e), x + TILE / 2, y - 9); wctx.textAlign = 'left';
       }
     });
   }
-  // Player (smooth display position, direction/frame-aware sprite).
+  // Player (smooth display position, direction/frame-aware sprite). The old
+  // always-on aura ring is a phase-1 relic kept only pre-sprite; once the
+  // player sprite is unlocked, aura shows as a charge-only flame overlay
+  // that fades out over a duration driven by the aura-% held at release.
   const ppx = view.px * TILE, ppy = view.py * TILE;
   add(view.px, view.py, () => {
-    if (w.player.aura > 0) {
-      ctx.strokeStyle = C.aura;
-      ctx.globalAlpha = 0.25 + 0.5 * (w.player.aura / w.player.maxAura);
-      ctx.beginPath(); ctx.arc(ppx + TILE / 2, ppy + TILE / 2, TILE * 0.8, 0, Math.PI * 2); ctx.stroke();
-      ctx.globalAlpha = 1;
+    if (!vis.player && w.player.aura > 0) {
+      wctx.strokeStyle = C.aura;
+      wctx.globalAlpha = 0.25 + 0.5 * (w.player.aura / w.player.maxAura);
+      wctx.beginPath(); wctx.arc(ppx + TILE / 2, ppy + TILE / 2, TILE * 0.8, 0, Math.PI * 2); wctx.stroke();
+      wctx.globalAlpha = 1;
     }
-    if (view.dodging) ctx.globalAlpha = 0.45;
+    if (view.dodging) wctx.globalAlpha = 0.45;
     if (vis.player) {
       const key = view.charging ? 'charge' : `${view.facing === 'left' || view.facing === 'right' ? 'side' : view.facing}-${view.walkFrame}`;
       const def = PLAYER_SPRITES[key] || PLAYER_SPRITES['down-0'];
       if (view.facing === 'right') {
-        ctx.save();
-        ctx.translate(ppx + TILE, ppy);
-        ctx.scale(-1, 1);
-        drawPixelSprite(ctx, def, 0, 0, TILE, filter);
-        ctx.restore();
+        wctx.save();
+        wctx.translate(ppx + TILE, ppy);
+        wctx.scale(-1, 1);
+        drawPixelSprite(wctx, def, 0, 0, TILE, 'none');
+        wctx.restore();
       } else {
-        drawPixelSprite(ctx, def, ppx, ppy, TILE, filter);
+        drawPixelSprite(wctx, def, ppx, ppy, TILE, 'none');
       }
+      const auraAlpha = auraFlameAlpha(view, now);
+      if (auraAlpha > 0) drawAuraFlame(wctx, ppx + TILE / 2, ppy + TILE * 0.2, auraAlpha, now);
     } else {
-      ctx.fillStyle = C.player;
-      fillSquashed(ctx, ppx + 4, ppy + 4, TILE - 8, TILE - 8, view.playerPunch || 0, true);
+      wctx.fillStyle = C.player;
+      fillSquashed(wctx, ppx + 4, ppy + 4, TILE - 8, TILE - 8, view.playerPunch || 0, true);
     }
-    ctx.globalAlpha = 1;
+    wctx.globalAlpha = 1;
   });
 
   // Depth facet: Y-sort + ground shadows.
@@ -230,8 +296,8 @@ export function render(ctx, w, view, now = 0) {
     drawables.sort((a, b) => (a.y - b.y) || (a.x - b.x));
     for (const d of drawables) {
       const [x, y] = tile(d.x, d.y);
-      ctx.fillStyle = 'rgba(0,0,0,0.28)';
-      ctx.beginPath(); ctx.ellipse(x + TILE / 2, y + TILE - 3, TILE * 0.34, TILE * 0.12, 0, 0, Math.PI * 2); ctx.fill();
+      wctx.fillStyle = 'rgba(0,0,0,0.28)';
+      wctx.beginPath(); wctx.ellipse(x + TILE / 2, y + TILE - 3, TILE * 0.34, TILE * 0.12, 0, 0, Math.PI * 2); wctx.fill();
     }
   }
   for (const d of drawables) d.fn();
@@ -242,14 +308,26 @@ export function render(ctx, w, view, now = 0) {
       const t = Math.max(0, Math.min(1, (now - p.start) / p.duration));
       const px = (p.x0 + (p.x1 - p.x0) * t) * TILE + TILE / 2;
       const py = (p.y0 + (p.y1 - p.y0) * t) * TILE + TILE / 2;
-      drawPixelSprite(ctx, BLAST_SPRITE, px - TILE * 0.3, py - TILE * 0.3, TILE * 0.6, filter);
+      drawPixelSprite(wctx, BLAST_SPRITE, px - TILE * 0.3, py - TILE * 0.3, TILE * 0.6, 'none');
     }
   }
 
+  // Single composite blit: the whole world-space layer, filtered ONCE — this
+  // is the fix for the multi-second frame stalls that per-drawImage filtering
+  // used to cause once world/enemies sprites (hundreds of draws/frame) were on.
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.filter = filter;
+  ctx.drawImage(layerCanvas, 0, 0);
+  ctx.filter = 'none';
+
   // Light facet: opacity-based shadowcasting from the player's line of sight.
   // A 100-opacity wall fully occludes what's behind it; walls are redrawn
-  // opaque on top so they still read as solid, visible occluders.
+  // opaque on top so they still read as solid, visible occluders. Drawn
+  // directly on the visible canvas (after the composite) — never the perf
+  // bottleneck: the darkness overlay is plain fillRect, and only a handful
+  // of on-screen wall tiles get redrawn.
   if (vis.light) {
+    ctx.setTransform(...camTransform);
     const originX = Math.round(view.px), originY = Math.round(view.py);
     const clarity = computeVisibility(w, originX, originY, VISION_RADIUS);
     for (let ty = minTY; ty <= maxTY; ty++) {
@@ -260,7 +338,7 @@ export function render(ctx, w, view, now = 0) {
         ctx.fillRect(tx * TILE, ty * TILE, TILE, TILE);
       }
     }
-    for (const [x, y] of walls) drawWall(x, y);
+    for (const [x, y] of walls) drawWallTo(ctx, filter, x, y);
   }
 
   // --- HUD (screen space, its own scale) -----------------------------------

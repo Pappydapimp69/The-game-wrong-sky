@@ -1,34 +1,54 @@
 // Procedural sound, unlocked in-world by attuning the resonance well (never a
 // settings toggle). Pure Web Audio — zero assets, a few oscillators with ADSR
-// envelopes. Presentation only: it reads sim EVENTS, never state, and stays
-// silent until enable() is called (which happens on the resonance attune, a
-// real user gesture, so the AudioContext is allowed to start).
+// envelopes. Presentation only: it reads sim EVENTS, never state.
+//
+// Mute-button pattern: prime() creates the AudioContext muted (gain 0) on the
+// player's very FIRST real input of the session — always a genuine user
+// gesture, so the browser autoplay gate never blocks it, even on a resumed
+// save where the resonance well was already attuned in a prior session.
+// unmute() (called on the real in-world attune) just raises the gain — no
+// context creation, so no gesture requirement to satisfy at that point.
 
 export function makeAudio() {
   let ctx = null;
   let master = null;
-  let on = false;
+  let primed = false;
+  let unmuted = false;
 
-  function enable() {
-    if (on) return;
+  function prime() {
+    if (primed) return;
     try {
       const AC = window.AudioContext || window.webkitAudioContext;
       if (!AC) return;
       ctx = new AC();
       master = ctx.createGain();
-      master.gain.value = 0.22;
+      master.gain.value = 0; // muted until the resonance well is attuned
       master.connect(ctx.destination);
-      on = true;
+      primed = true;
+    } catch { primed = false; }
+  }
+
+  // Raises the gain so scheduled tones become audible. `quiet` skips the
+  // confirmation chord — used when silently re-unmuting a resumed save
+  // where audio was already unlocked in a prior session.
+  function unmute({ quiet = false } = {}) {
+    if (!primed) prime();
+    if (!primed || unmuted) return;
+    unmuted = true;
+    master.gain.value = 0.22;
+    if (!quiet) {
       // A soft rising "the world sounds again" chord as confirmation.
       blip(440, 0.0, 'sine', 0.18);
       blip(660, 0.06, 'sine', 0.18);
       blip(880, 0.12, 'triangle', 0.22);
-    } catch { on = false; }
+    }
   }
 
-  // One enveloped tone. t0 = delay (s) from now; dur = length (s).
+  // One enveloped tone. t0 = delay (s) from now; dur = length (s). Scheduled
+  // as soon as the context is primed, even while muted — silence is just
+  // gain 0, not "nothing happening."
   function blip(freq, t0 = 0, type = 'square', dur = 0.12, slideTo = null) {
-    if (!on || !ctx) return;
+    if (!primed || !ctx) return;
     const start = ctx.currentTime + t0;
     const osc = ctx.createOscillator();
     const g = ctx.createGain();
@@ -47,7 +67,7 @@ export function makeAudio() {
 
   // Event-named cues. Unknown names are ignored, so game.js can call freely.
   function play(name) {
-    if (!on) return;
+    if (!primed) return;
     switch (name) {
       case 'melee': blip(220, 0, 'square', 0.09, 140); break;
       case 'aura': blip(520, 0, 'sawtooth', 0.16, 180); break;
@@ -66,5 +86,5 @@ export function makeAudio() {
     }
   }
 
-  return { enable, play, get enabled() { return on; } };
+  return { prime, unmute, play, get enabled() { return unmuted; } };
 }

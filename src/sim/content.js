@@ -167,6 +167,7 @@ export const CONTENT = {
     bossTaunted: [
       'Half-broken, it laughs. "The Firstborn all died alone. Did no one tell you?"',
       'Its aura flares darker — it stops holding back.',
+      '"I haven’t learned to move yet," it admits. "The next one will."',
     ],
     finale: [
       'The Second lies still. The wrong sky, mended behind you, holds its new colour.',
