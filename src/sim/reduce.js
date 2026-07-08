@@ -8,25 +8,28 @@
 //   there is no "invulnerable" flag in authoritative state.
 // - Enemy aggression is its own command (ENEMY_STRIKE), issued by the
 //   presentation layer's AI driver, so the sim stays a pure reducer.
-// - Quests are offered, never pushed: TALK emits an offer; only ACCEPT_QUEST
-//   activates it. Declining costs nothing and the offer stays available.
+// - Quests are offered, never pushed: TALK emits offers for every quest whose
+//   giver/prereqs match; only ACCEPT_QUEST activates one. Declining costs
+//   nothing and the offer(s) stay available.
+// - Wells are ALWAYS present (never existence-gated) — ATTUNE only has a real
+//   effect on the well matching the CURRENT active quest's attune facet; any
+//   other well returns its always-present flavor hint, never an error.
 
 import { nextInt } from './rng.js';
 import { isNight } from './daynight.js';
 
-const MELEE_RANGE = 1;   // Chebyshev tiles
+const MELEE_RANGE = 1;
 const BLAST_RANGE = 3;
 const BLAST_COST = 3;
-const XP_PER_LEVEL = 5;  // lvl N -> N+1 costs N*XP_PER_LEVEL
+const XP_PER_LEVEL = 5;
 
-// Charge is press-and-hold, not tap-spam: the presentation dispatches one
-// CHARGE per fixed real-time tick while the button stays down (start:true on
-// the frame the hold begins, resetting the ramp). Rate = a mild ramp with hold
-// duration, reshaped by CURRENT aura fill: fast from empty, throttled hard
-// above the 80% mark regardless of how long the hold has run.
-const CHARGE_RAMP_STEP = 4;  // every N consecutive ticks held...
-const CHARGE_RAMP_CAP = 8;   // ...up to this many ticks of bonus
-const CHARGE_TOP_PCT = 80;   // aura % at/above which charging is throttled
+const CHARGE_RAMP_STEP = 4;
+const CHARGE_RAMP_CAP = 8;
+const CHARGE_TOP_PCT = 80;
+
+// The three sprite-reveal quests, in the order their completion is tracked
+// for the branching narrative (order picked, not this list's order).
+const REVEAL_QUESTS = { 'reveal-player': 'player', 'reveal-world': 'world', 'reveal-enemies': 'enemies' };
 
 export function reduce(state, command) {
   const events = reduceCore(state, command);
@@ -46,13 +49,17 @@ function reduceCore(state, command) {
       if (!Number.isInteger(dx) || !Number.isInteger(dy)) throw new Error('MOVE: dx/dy must be integers');
       const nx = clamp(state.player.x + clamp(dx, -1, 1), 0, state.region.w - 1);
       const ny = clamp(state.player.y + clamp(dy, -1, 1), 0, state.region.h - 1);
-      if (state.region.blocked[`${nx},${ny}`]) return [{ type: 'blocked', x: nx, y: ny }];
+      // Collision is existence-based, not magnitude-based: a 0-opacity blocked
+      // tile (a legitimate future case — an invisible solid) must still block
+      // movement. `blocked[key]` stores the OPACITY value, which would be
+      // falsy at exactly 0, so check key presence, not truthiness.
+      if (Object.prototype.hasOwnProperty.call(state.region.blocked, `${nx},${ny}`)) {
+        return [{ type: 'blocked', x: nx, y: ny }];
+      }
       state.player.x = nx;
       state.player.y = ny;
       const events = [{ type: 'moved', x: nx, y: ny }];
       questProgress(state, events, 'reach', null);
-      // The rift gate is the region's authoritative exit: sealed until the
-      // finale arc is complete; stepping through when it is ends the chapter.
       const gate = state.region.zones['rift-gate'];
       if (gate && Math.max(Math.abs(nx - gate.x), Math.abs(ny - gate.y)) <= gate.r) {
         if (state.arc.complete && !state.flags.ended) {
@@ -70,10 +77,19 @@ function reduceCore(state, command) {
       if (!npc) throw new Error(`TALK: no npc ${command.npcId}`);
       if (dist(state.player, npc) > 1) return [{ type: 'too_far', target: command.npcId }];
       const events = [{ type: 'talked', npc: command.npcId }];
-      const q = npc.offers;
-      if (q && !state.quests.active[q] && !state.quests.completed[q]) {
-        state.quests.offered[q] = 1;
-        events.push({ type: 'quest_offered', quest: q });
+      // Offer EVERY quest this npc gives whose prereqs are met and that isn't
+      // already active/completed — this is what makes a 3-way (then 2-way,
+      // then 1-way) choice possible: all currently-eligible quests surface
+      // together as one combined offer, not one at a time.
+      const offerable = Object.entries(state.quests.defs)
+        .filter(([qid, def]) => def.giver === command.npcId)
+        .filter(([qid]) => !state.quests.active[qid] && !state.quests.completed[qid])
+        .filter(([qid, def]) => (def.requires || []).every((r) => state.quests.completed[r]))
+        .map(([qid]) => qid)
+        .sort();
+      if (offerable.length) {
+        for (const qid of offerable) state.quests.offered[qid] = 1;
+        events.push({ type: 'quests_offered', quests: offerable });
       }
       return events;
     }
@@ -82,11 +98,17 @@ function reduceCore(state, command) {
       const q = command.questId;
       if (!state.quests.offered[q]) throw new Error(`ACCEPT_QUEST: ${q} not offered`);
       const def = state.quests.defs[q];
-      delete state.quests.offered[q];
+      // Accepting one offer withdraws EVERY other still-pending offer from the
+      // same giver — the philosophical pick is exclusive; picking one of the
+      // 3-way (then 2-way) choice must not leave the others silently
+      // acceptable too. The next TALK recomputes the correct remaining
+      // offerable set from scratch (active/completed/requires), so nothing
+      // legitimately eligible is lost — only the stale batch is cleared.
+      for (const oid of Object.keys(state.quests.offered)) {
+        if (state.quests.defs[oid].giver === def.giver) delete state.quests.offered[oid];
+      }
       state.quests.active[q] = { progress: def.objectives.map(() => 0) };
       const events = [{ type: 'quest_accepted', quest: q }];
-      // Unlock entities on accept — never before. Nothing this quest needs
-      // existed until now, so completion never depends on prior actions.
       if (def.unlocks) {
         for (const [id, tmpl] of Object.entries(def.unlocks.enemies || {})) {
           state.enemies[id] = { ...tmpl };
@@ -95,10 +117,6 @@ function reduceCore(state, command) {
         for (const [id, tmpl] of Object.entries(def.unlocks.pickups || {})) {
           state.pickups[id] = { ...tmpl };
           events.push({ type: 'pickup_appeared', target: id, item: tmpl.item });
-        }
-        for (const [id, tmpl] of Object.entries(def.unlocks.wells || {})) {
-          state.wells[id] = { ...tmpl };
-          events.push({ type: 'well_appeared', target: id, facet: tmpl.grants });
         }
       }
       return events;
@@ -109,7 +127,7 @@ function reduceCore(state, command) {
       if (!p) throw new Error(`INTERACT: no pickup ${command.pickupId}`);
       if (p.taken) return [{ type: 'nothing_there', target: command.pickupId }];
       if (dist(state.player, p) > 1) return [{ type: 'too_far', target: command.pickupId }];
-      p.taken = 1; // deactivate the one-shot the instant it's taken
+      p.taken = 1;
       state.player.inventory.push(p.item);
       const events = [{ type: 'picked_up', item: p.item }];
       questProgress(state, events, 'collect', p.item);
@@ -117,19 +135,23 @@ function reduceCore(state, command) {
     }
 
     case 'ATTUNE': {
-      // The signature verb: attune a well to restore a facet of the drained
-      // world. Idempotent per well (a well answers once). 'audio' flips a
-      // presentation flag; the three visual facets set authoritative flags the
-      // renderer reads.
       const wl = state.wells[command.wellId];
       if (!wl) throw new Error(`ATTUNE: no well ${command.wellId}`);
-      if (wl.attuned) return [{ type: 'nothing_there', target: command.wellId }];
       if (dist(state.player, wl) > 1) return [{ type: 'too_far', target: command.wellId }];
+      if (wl.attuned) return [{ type: 'nothing_there', target: command.wellId }];
+      // Effect-gated, not existence-gated: this well only does something if
+      // its facet matches an objective on a currently ACTIVE quest. Anything
+      // else is a soft non-effect with the well's always-present flavor hint
+      // — never a throw, never a hard refusal (the well simply hasn't been
+      // "asked the right question" yet).
+      if (!activeAttuneFacets(state).has(wl.grants)) {
+        return [{ type: 'well_hint', well: command.wellId, facet: wl.grants }];
+      }
       wl.attuned = 1;
       const facet = wl.grants;
       const events = [{ type: 'attuned', well: command.wellId, facet }];
       if (facet === 'audio') state.flags.audio = 1;
-      else state.visual[facet] = 1; // 'color' | 'light' | 'depth'
+      else state.visual[facet] = 1; // 'player' | 'world' | 'enemies' | 'light'
       questProgress(state, events, 'attune', facet);
       return events;
     }
@@ -148,8 +170,6 @@ function reduceCore(state, command) {
       const e = livingEnemy(state, command.enemyId, 'MELEE');
       if (typeof e === 'object' && e.type) return [e];
       if (dist(state.player, e) > MELEE_RANGE) return [{ type: 'too_far', target: command.enemyId }];
-      // Immunity is a distinct, visible refusal (like too_far/no_aura) — never
-      // a silent no-op. No XP either: nothing was accomplished.
       if (e.immune === 'melee') return [{ type: 'no_effect', target: command.enemyId, kind: 'melee' }];
       const dmg = state.player.skills.melee.lvl + 1 + nextInt(state.rng, 4);
       const events = hitEnemy(state, command.enemyId, e, dmg, 'melee');
@@ -165,12 +185,10 @@ function reduceCore(state, command) {
 
       let gain;
       if (pct >= CHARGE_TOP_PCT) {
-        // Throttled near the cap — half the base rate, ignoring the ramp
-        // entirely: "slower after 80%, regardless of how long held."
         gain = hold % 2 === 0 ? 1 : 0;
       } else {
         gain = 1 + Math.floor(Math.min(hold, CHARGE_RAMP_CAP) / CHARGE_RAMP_STEP);
-        if (pct <= 0) gain += 1; // fills fastest from empty
+        if (pct <= 0) gain += 1;
       }
 
       p.aura = Math.min(p.maxAura, p.aura + gain);
@@ -184,9 +202,6 @@ function reduceCore(state, command) {
       if (dist(state.player, e) > BLAST_RANGE) return [{ type: 'too_far', target: command.enemyId }];
       if (state.player.aura < BLAST_COST) return [{ type: 'no_aura', need: BLAST_COST }];
       state.player.aura -= BLAST_COST;
-      // The blast still fires and still costs aura — it just does nothing
-      // against a crystalline hide. A clear, distinct event either way (never a
-      // silent no-op), matching the MELEE case above.
       if (e.immune === 'aura') return [{ type: 'no_effect', target: command.enemyId, kind: 'aura' }];
       const dmg = state.player.skills.aura.lvl + 2 + nextInt(state.rng, 6);
       const events = hitEnemy(state, command.enemyId, e, dmg, 'aura');
@@ -195,9 +210,6 @@ function reduceCore(state, command) {
     }
 
     case 'CHOOSE_FATE': {
-      // Game 2's one real choice — it travels into the saga export and colours
-      // how the rival returns in Part III. 'spare' leaves you as you are;
-      // 'claim' takes the Second's power (a permanent aura-skill gain).
       if (!state.arc.bossDefeated || state.arc.complete) return [{ type: 'not_now' }];
       if (command.fate !== 'spare' && command.fate !== 'claim') {
         throw new Error(`CHOOSE_FATE: bad fate ${command.fate}`);
@@ -216,9 +228,6 @@ function reduceCore(state, command) {
       const e = livingEnemy(state, command.enemyId, 'ENEMY_STRIKE');
       if (typeof e === 'object' && e.type) return [e];
       if (dist(state.player, e) > MELEE_RANGE) return [{ type: 'too_far', target: command.enemyId }];
-      // Difficulty is a SETTING, not a decision — both tones ship (gentle is
-      // the default; harsh raises every enemy hit by 1). Night stacks its own
-      // +1: the clock is pressure, not paint.
       const dmg = e.power + nextInt(state.rng, 3)
         + (state.settings.difficulty === 'harsh' ? 1 : 0)
         + (isNight(state.tick) ? 1 : 0);
@@ -253,7 +262,6 @@ function reduceCore(state, command) {
   }
 }
 
-// Runs a command stream. Test/replay helper.
 export function replay(state, commands) {
   const events = [];
   for (const c of commands) events.push(...reduce(state, c));
@@ -264,6 +272,18 @@ export function replay(state, commands) {
 
 function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
 function dist(a, b) { return Math.max(Math.abs(a.x - b.x), Math.abs(a.y - b.y)); }
+
+// The set of facets a well-attune would currently take real effect for — at
+// most one active quest's `attune` objective at a time in this content, but
+// this scans generally so future content can layer more without a rewrite.
+function activeAttuneFacets(state) {
+  const facets = new Set();
+  for (const qId of Object.keys(state.quests.active)) {
+    const def = state.quests.defs[qId];
+    for (const obj of def.objectives) if (obj.type === 'attune') facets.add(obj.facet);
+  }
+  return facets;
+}
 
 function livingEnemy(state, id, cmd) {
   const e = state.enemies[id];
@@ -284,7 +304,6 @@ function hitEnemy(state, id, e, dmg, kind) {
   return events;
 }
 
-// Use-based growth: the skill you exercise is the skill that levels.
 function gainXp(state, events, skillName) {
   const s = state.player.skills[skillName];
   s.xp += 1;
@@ -295,9 +314,6 @@ function gainXp(state, events, skillName) {
   }
 }
 
-// The finale arc OBSERVES the events of every command — it never intercepts
-// them. The rival crests the rift once the sky is mended (the "Mend the Sky"
-// quest is complete) and the player stands at the rift's edge.
 function arcObserve(state, events) {
   const arc = state.arc;
   if (!arc || state.flags.ended) return;
@@ -306,8 +322,7 @@ function arcObserve(state, events) {
     if (e.type === 'enemy_defeated' && e.target === arc.bossDef.id) arc.bossDefeated = 1;
   }
 
-  // Spawn the rival: sky mended + standing at the rift's edge. Never respawns.
-  if (!arc.bossSpawned && state.quests.completed['mend-the-sky']) {
+  if (!arc.bossSpawned && state.quests.completed['mend-the-sky-finale']) {
     const edge = state.region.zones['rift-edge'];
     const atEdge = edge && Math.max(Math.abs(state.player.x - edge.x), Math.abs(state.player.y - edge.y)) <= edge.r;
     if (atEdge && !state.enemies[arc.bossDef.id]) {
@@ -322,7 +337,6 @@ function arcObserve(state, events) {
     }
   }
 
-  // At half health the Second stops holding back: a taunt, and +1 power.
   if (arc.bossSpawned && !arc.bossTaunted) {
     const boss = state.enemies[arc.bossDef.id];
     if (boss && boss.alive && boss.hp <= Math.floor(boss.maxHp / 2)) {
@@ -333,8 +347,6 @@ function arcObserve(state, events) {
   }
 }
 
-// Objective progress for all active quests. Objective types are the
-// code/content seam: adding a quest is data; adding a TYPE is a case here.
 function questProgress(state, events, type, target) {
   for (const qId of Object.keys(state.quests.active).sort()) {
     const def = state.quests.defs[qId];
@@ -362,6 +374,10 @@ function questProgress(state, events, type, target) {
       delete state.quests.active[qId];
       state.quests.completed[qId] = 1;
       state.player.coins += def.reward.coins || 0;
+      // Track the ORDER the three sprite-reveal quests complete in — this is
+      // what makes the branching narrative order-sensitive (ABC vs BCA),
+      // not just set-sensitive.
+      if (REVEAL_QUESTS[qId]) state.flags.revealOrder.push(REVEAL_QUESTS[qId]);
       events.push({ type: 'quest_completed', quest: qId, reward: def.reward });
     }
   }

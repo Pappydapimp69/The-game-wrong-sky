@@ -3,6 +3,14 @@
 // (as ENEMY_STRIKE commands — the sim never acts on its own), plays sound, and
 // manages modals. Modals pause the overworld but never the loop itself; every
 // dismissal funnels through one closeModal() so no stale flags survive.
+//
+// Modal navigation (uniform across every modal): options are a navigable list
+// with NO default selection — a stray press can't accidentally confirm
+// anything. A modal with exactly one option instead requires a deliberate
+// PRESS-AND-HOLD on blast/X (a button distinct from confirm/attack, which
+// used to double-fire on the same physical gamepad button) so combat mashing
+// can never eat a story beat. Mouse/touch always select-and-confirm directly
+// by tapping the option's zone, no navigation required.
 
 import { makeWorld } from '../sim/world.js';
 import { reduce } from '../sim/reduce.js';
@@ -21,6 +29,9 @@ const TICK_MS = 500;
 const DODGE_MS = 400;
 const ENEMY_CD_MS = 900;
 const MAX_FRAME_MS = 100;
+const HOLD_DISMISS_MS = 1200; // single-button dialogs: hold blast/X this long
+const KALEIDOSCOPE_MS = 7000; // the light well's hue-cycle color reveal
+const WALK_FRAME_MS = 220;
 
 const dist = (a, b) => Math.max(Math.abs(a.x - b.x), Math.abs(a.y - b.y));
 
@@ -31,30 +42,29 @@ export function startGame(canvas, seed, options = {}, initialWorld = null) {
 
   let world = initialWorld || makeWorld(seed, options);
   let ro = readonly(world);
-  if (world.flags.audio) audio.enable(); // a resumed save that already had sound on
-  // The run's exact restart point for "Rise Again". Snapshotting the actual
-  // starting world (not re-running makeWorld with the caller's options) keeps
-  // the right archetype, difficulty, seed, carried skills, and RNG on death —
-  // a CONTINUE passes empty options, so makeWorld would otherwise resurrect a
-  // default Brawler.
+  if (world.flags.audio) audio.enable();
   let respawn = JSON.stringify(world);
+
   const view = {
     px: world.player.x, py: world.player.y,
     toasts: [], modal: null, dodging: false, device: 'keyboard',
     guide: '', shakeX: 0, shakeY: 0, punch: {}, playerPunch: 0, night: 0,
+    facing: 'down', walkFrame: 0, charging: false,
+    projectiles: [],
+    // Kaleidoscope: null until the light well fires this session, then a
+    // {start,until} window the renderer reads to hue-cycle sprites into their
+    // true color. A RESUMED save where light was already attuned shows full
+    // color immediately (null = "no animation in progress", not "off").
+    kaleidoscope: null,
   };
   if (!initialWorld) {
-    view.modal = {
-      kind: 'dialog', title: 'WRONG SKY',
-      lines: CONTENT.arc.intro,
-      buttons: [{ id: 'confirm', label: 'Step through' }],
-    };
+    view.modal = mkDialog('WRONG SKY', CONTENT.arc.intro, 'continue');
   }
   let nextMoveAt = 0, nextTickAt = 0, dodgeUntil = 0;
   let nextChargeAt = 0, wasCharging = false;
   const CHARGE_TICK_MS = 100;
   const enemyCd = {};
-  let last = 0, frameNow = 0, lastModalDy = 0;
+  let last = 0, frameNow = 0, lastModalDy = 0, nextWalkFrameAt = 0;
 
   let hitStopUntil = 0, shakeUntil = 0, shakeStart = 0, shakeMag = 0;
   const PUNCH_MS = 160, PLAYER_PUNCH_MS = 120;
@@ -68,10 +78,6 @@ export function startGame(canvas, seed, options = {}, initialWorld = null) {
   function dispatch(cmd) {
     const events = reduce(world, cmd);
     for (const e of events) onEvent(e);
-    // Never persist a dead or finished state: a hp-0 save resumes as a "zombie"
-    // that walks around until the next strike re-opens the defeat modal. The
-    // last good save (just before the fatal blow) is what a mid-death resume
-    // gets instead.
     if (!world.flags.ended && world.player.hp > 0) saveGame(world);
     return events;
   }
@@ -79,7 +85,16 @@ export function startGame(canvas, seed, options = {}, initialWorld = null) {
   function toast(text) { view.toasts.unshift({ text, ttl: 2600 }); if (view.toasts.length > 4) view.toasts.pop(); }
   function closeModal() { view.modal = null; }
 
-  // Aggregate the flat inventory array into a display list.
+  // --- modal construction helpers -------------------------------------------
+  // Every modal is { kind, title, lines, options:[{id,label,hintAction?}], sel,
+  // holdStart, holdProgress }. `sel` starts null: nothing is pre-highlighted.
+  function mkModal(kind, title, lines, options) {
+    return { kind, title, lines, options, sel: null, holdStart: null, holdProgress: 0 };
+  }
+  function mkDialog(title, lines, optionId, label) {
+    return mkModal('dialog', title, lines, [{ id: optionId, label: label || 'Continue', hintAction: 'confirm' }]);
+  }
+
   function inventoryItems() {
     const counts = {};
     for (const id of world.player.inventory) counts[id] = (counts[id] || 0) + 1;
@@ -88,8 +103,14 @@ export function startGame(canvas, seed, options = {}, initialWorld = null) {
       count: counts[id], usable: !!(world.items[id] && world.items[id].heal),
     }));
   }
-  function openInventory() { view.modal = { kind: 'inventory', items: inventoryItems(), sel: 0 }; }
+  function openInventory() {
+    const items = inventoryItems();
+    const options = items.map((it) => ({ id: `use:${it.id}`, label: `${it.name}${it.count > 1 ? ` x${it.count}` : ''}`, usable: it.usable }));
+    options.push({ id: 'close', label: 'Close', hintAction: 'cancel' });
+    view.modal = mkModal('inventory', 'Satchel', [], options);
+  }
 
+  // --- sim event -> presentation --------------------------------------------
   function onEvent(e) {
     switch (e.type) {
       case 'talked': {
@@ -98,36 +119,47 @@ export function startGame(canvas, seed, options = {}, initialWorld = null) {
         if (npc.shop && npc.shop.length) {
           const itemId = npc.shop[0];
           const item = world.items[itemId];
-          view.modal = {
-            kind: 'shop', itemId, title: npc.name,
-            lines: [...lines, `${item.name} — heals ${item.heal} HP — ${item.price} coins. You have ${world.player.coins}.`],
-            buttons: [
-              { id: 'confirm', label: `Buy ${item.name}` },
-              { id: 'alt', label: `Drink ${item.name}` },
-              { id: 'cancel', label: 'Leave' },
-            ],
-          };
+          view.modal = mkModal('shop', npc.name,
+            [...lines, `${item.name} — heals ${item.heal} HP — ${item.price} coins. You have ${world.player.coins}.`],
+            [
+              { id: 'buy', label: `Buy ${item.name}` },
+              { id: 'drink', label: `Drink ${item.name}` },
+              { id: 'leave', label: 'Leave', hintAction: 'cancel' },
+            ]);
+          view.modal.itemId = itemId;
         } else if (!view.modal) {
-          view.modal = { kind: 'dialog', title: npc.name, lines, buttons: [{ id: 'cancel', label: 'Close' }] };
+          view.modal = mkDialog(npc.name, lines, 'close', 'Close');
         }
         break;
       }
-      case 'quest_offered': {
-        const def = world.quests.defs[e.quest];
-        view.modal = {
-          kind: 'offer', quest: e.quest, title: `Quest: ${def.name}`,
-          lines: [...def.objectives.map(describeObjective), `Reward: ${def.reward.coins} coins`, 'No pressure — the offer stands if you walk away.'],
-          buttons: [{ id: 'confirm', label: 'Accept' }, { id: 'cancel', label: 'Later' }],
-        };
+      case 'quests_offered': {
+        const options = e.quests.map((qid) => {
+          const def = world.quests.defs[qid];
+          const branchOpt = CONTENT.branch.options[qid.replace('reveal-', '')];
+          const label = branchOpt ? branchOpt.label : def.name;
+          return { id: qid, label };
+        });
+        options.push({ id: 'notnow', label: 'Not now', hintAction: 'cancel' });
+        const flavor = questOfferFlavor(e.quests);
+        view.modal = mkModal('offer', 'Sable', flavor, options);
         break;
       }
-      case 'enemy_appeared': toast(`A ${world.enemies[e.target] ? kindName(world.enemies[e.target].kind) : e.kind} stirs.`); break;
-      case 'well_appeared': toast('A well reveals itself — attune it.'); break;
+      case 'enemy_appeared': toast(`${kindName(world.enemies[e.target]?.kind || e.kind)} stirs.`); break;
       case 'pickup_appeared': toast('Something glints nearby.'); break;
       case 'picked_up': toast(`Picked up ${prettify(e.item)}`); audio.play('pickup'); break;
+      case 'well_hint': {
+        const wl = CONTENT.regions[world.region.id].wells[e.well];
+        toast(wl?.hint || '...nothing happens.');
+        break;
+      }
       case 'attuned':
         if (e.facet === 'audio') { audio.enable(); toast('The world sounds again.'); }
-        else toast(`${cap(e.facet)} returns to the world.`);
+        else if (e.facet === 'light') {
+          toast('The world snaps into focus, all at once.');
+          view.kaleidoscope = { start: frameNow, until: frameNow + KALEIDOSCOPE_MS };
+        } else {
+          toast(`${cap(e.facet)} takes shape.`);
+        }
         audio.play('attune');
         shake(3, 200); hitStop(60);
         break;
@@ -142,11 +174,9 @@ export function startGame(canvas, seed, options = {}, initialWorld = null) {
       case 'enemy_defeated':
         toast(`${kindName(e.kind)} defeated!`); hitStop(90); shake(5, 160); audio.play('defeat');
         if (e.target === world.arc.bossDef.id) {
-          view.modal = {
-            kind: 'fate', title: 'The Second kneels',
-            lines: ['It is beaten either way.', 'Do you take its power, or leave it be?'],
-            buttons: [{ id: 'confirm', label: 'Spare it' }, { id: 'alt', label: 'Claim its power' }],
-          };
+          view.modal = mkModal('fate', 'The Second kneels',
+            ['It is beaten either way.', 'Do you take its power, or leave it be?'],
+            [{ id: 'spare', label: 'Spare it' }, { id: 'claim', label: 'Claim its power' }]);
         }
         break;
       case 'player_hit': toast(`Took ${e.dmg} damage`); hitStop(60); shake(Math.min(8, 3 + e.dmg * 0.7), 180); audio.play('hurt'); break;
@@ -162,29 +192,43 @@ export function startGame(canvas, seed, options = {}, initialWorld = null) {
       case 'no_item': toast('Nothing to drink'); break;
       case 'nothing_there': break;
       case 'player_defeated':
-        view.modal = { kind: 'defeat', title: 'You fall...', lines: ['The Reach goes quiet.'], buttons: [{ id: 'confirm', label: 'Rise Again' }] };
+        view.modal = mkDialog('You fall...', ['The Reach goes quiet.'], 'rise', 'Rise Again');
+        view.modal.kind = 'defeat';
         break;
       case 'exit_locked': toast('The rift is sealed. You are not done here.'); break;
       case 'boss_appeared':
         shake(10, 450); hitStop(150); audio.play('boss');
-        view.modal = { kind: 'dialog', title: 'The Second', lines: CONTENT.arc.bossAppeared, buttons: [{ id: 'confirm', label: 'Stand' }] };
+        view.modal = mkDialog('The Second', CONTENT.arc.bossAppeared, 'stand', 'Stand');
         break;
       case 'boss_taunted':
         shake(8, 300); hitStop(120); audio.play('boss');
-        view.modal = { kind: 'dialog', title: 'It stops holding back', lines: CONTENT.arc.bossTaunted, buttons: [{ id: 'confirm', label: 'Endure' }] };
+        view.modal = mkDialog('It stops holding back', CONTENT.arc.bossTaunted, 'endure', 'Endure');
         break;
       case 'chapter_complete': {
         clearSave();
         audio.play('chapter');
         const code = exportSaga(world);
-        view.modal = {
-          kind: 'finale', title: 'THE RIFT CLOSES BEHIND YOU', code,
-          lines: [...CONTENT.arc.finale, '', CONTENT.arc.exportHint, code],
-          buttons: [{ id: 'confirm', label: 'Copy code' }],
-        };
+        view.modal = mkDialog('THE RIFT CLOSES BEHIND YOU', [...CONTENT.arc.finale, '', CONTENT.arc.exportHint, code], 'copy', 'Copy code');
+        view.modal.kind = 'finale';
+        view.modal.code = code;
         break;
       }
     }
+  }
+
+  // Sable's line(s) reacting to the choice(s) so far, shown atop whichever
+  // quest(s) she's currently offering — keyed on the ORDER facets were picked
+  // (state.flags.revealOrder), so ABC reads differently than BCA.
+  function questOfferFlavor(offeredQuests) {
+    if (offeredQuests.includes('hear-the-world')) return [];
+    const order = world.flags.revealOrder;
+    if (offeredQuests.length === 3) return CONTENT.branch.prompt;
+    if (offeredQuests.length === 2) return CONTENT.branch.afterFirst[order[0]] || [];
+    if (offeredQuests.length === 1 && offeredQuests[0] !== 'mend-the-sky-finale') {
+      return CONTENT.branch.afterSecond[order.slice(0, 2).join(',')] || [];
+    }
+    if (offeredQuests.includes('mend-the-sky-finale')) return CONTENT.branch.finale[order.join(',')] || [];
+    return [];
   }
 
   function nearest(map, range, ok = () => true) {
@@ -198,47 +242,67 @@ export function startGame(canvas, seed, options = {}, initialWorld = null) {
     return best;
   }
 
-  function handleModal(presses, move) {
-    const m = view.modal;
-    if (m.kind === 'inventory') {
-      const n = m.items.length;
-      if (n) {
-        if (move.dy > 0 && lastModalDy <= 0) m.sel = (m.sel + 1) % n;
-        if (move.dy < 0 && lastModalDy >= 0) m.sel = (m.sel - 1 + n) % n;
-      }
-      // A tapped/clicked item row is a direct pick.
-      for (const it of m.items) { if (presses[`item:${it.id}`]) { m.sel = m.items.indexOf(it); useSelected(m); return; } }
-      if (presses.confirm || presses.interact) { useSelected(m); return; }
-      if (presses.cancel || presses.dodge || presses.inventory) closeModal();
-      return;
-    }
-    if (presses.confirm || (m.kind !== 'shop' && presses.interact)) {
-      if (m.kind === 'offer') { dispatch({ type: 'ACCEPT_QUEST', questId: m.quest }); closeModal(); toast('Quest accepted'); }
-      else if (m.kind === 'shop') { dispatch({ type: 'BUY', itemId: m.itemId }); }
-      else if (m.kind === 'defeat') { world = JSON.parse(respawn); ro = readonly(world); saveGame(world); closeModal(); toast('You rise where you began.'); }
-      else if (m.kind === 'fate') { dispatch({ type: 'CHOOSE_FATE', fate: 'spare' }); closeModal(); toast('You let it live. It watches you go.'); }
-      else if (m.kind === 'finale') { if (navigator.clipboard?.writeText) navigator.clipboard.writeText(m.code).catch(() => {}); toast('Code copied. See you in Part III.'); }
-      else closeModal();
-      return;
-    }
-    if (presses.alt || presses.blast) {
-      if (m.kind === 'shop') dispatch({ type: 'USE_ITEM', itemId: m.itemId });
-      else if (m.kind === 'fate') { dispatch({ type: 'CHOOSE_FATE', fate: 'claim' }); closeModal(); toast('You take what it was. It costs you nothing you can name yet.'); }
-      return;
-    }
-    if (presses.cancel || presses.dodge) {
-      if (m.kind === 'fate' || m.kind === 'defeat') return; // undismissable choices
-      closeModal();
+  // Runs whichever option the modal resolved to (navigated+confirmed, or
+  // tapped directly). Each modal `kind` interprets its own option ids.
+  function runOption(m, opt) {
+    switch (m.kind) {
+      case 'dialog': case 'defeat': case 'finale':
+        if (m.kind === 'defeat') { world = JSON.parse(respawn); ro = readonly(world); saveGame(world); closeModal(); toast('You rise where you began.'); }
+        else if (m.kind === 'finale') { if (navigator.clipboard?.writeText) navigator.clipboard.writeText(m.code).catch(() => {}); toast('Code copied. See you in Part III.'); closeModal(); }
+        else closeModal();
+        break;
+      case 'offer':
+        if (opt.id === 'notnow') { closeModal(); toast('The offer stands.'); }
+        else { dispatch({ type: 'ACCEPT_QUEST', questId: opt.id }); closeModal(); toast('Chosen.'); }
+        break;
+      case 'shop':
+        if (opt.id === 'buy') dispatch({ type: 'BUY', itemId: m.itemId });
+        else if (opt.id === 'drink') dispatch({ type: 'USE_ITEM', itemId: m.itemId });
+        else closeModal();
+        break;
+      case 'fate':
+        dispatch({ type: 'CHOOSE_FATE', fate: opt.id });
+        closeModal();
+        toast(opt.id === 'spare' ? 'You let it live. It watches you go.' : 'You take what it was. It costs you nothing you can name yet.');
+        break;
+      case 'inventory':
+        if (opt.id === 'close') { closeModal(); break; }
+        if (!opt.usable) { toast('A key item — nothing to use it on yet.'); break; }
+        dispatch({ type: 'USE_ITEM', itemId: opt.id.slice(4) });
+        {
+          const items = inventoryItems();
+          const options = items.map((it) => ({ id: `use:${it.id}`, label: `${it.name}${it.count > 1 ? ` x${it.count}` : ''}`, usable: it.usable }));
+          options.push({ id: 'close', label: 'Close', hintAction: 'cancel' });
+          view.modal.options = options;
+          view.modal.sel = view.modal.sel != null ? Math.min(view.modal.sel, options.length - 1) : null;
+        }
+        break;
     }
   }
 
-  function useSelected(m) {
-    const it = m.items[m.sel];
-    if (!it) return;
-    if (!it.usable) { toast('A key item — nothing to use it on yet.'); return; }
-    dispatch({ type: 'USE_ITEM', itemId: it.id });
-    m.items = inventoryItems();
-    if (m.sel >= m.items.length) m.sel = Math.max(0, m.items.length - 1);
+  function handleModal(now, presses, move, blastHeld) {
+    const m = view.modal;
+    const opts = m.options;
+
+    if (opts.length === 1) {
+      if (blastHeld) {
+        if (m.holdStart == null) m.holdStart = now;
+        m.holdProgress = Math.min(1, (now - m.holdStart) / HOLD_DISMISS_MS);
+        if (now - m.holdStart >= HOLD_DISMISS_MS) { runOption(m, opts[0]); }
+      } else {
+        m.holdStart = null;
+        m.holdProgress = 0;
+      }
+      // Direct tap always works too (touch/mouse zone click is deliberate).
+      if (presses[opts[0].id]) runOption(m, opts[0]);
+      return;
+    }
+
+    if (move.dy > 0 && lastModalDy <= 0) m.sel = m.sel == null ? 0 : (m.sel + 1) % opts.length;
+    if (move.dy < 0 && lastModalDy >= 0) m.sel = m.sel == null ? opts.length - 1 : (m.sel - 1 + opts.length) % opts.length;
+    if (presses.confirm && m.sel != null) { runOption(m, opts[m.sel]); return; }
+    for (const opt of opts) { if (presses[opt.id]) { runOption(m, opt); return; } }
+    if (presses.cancel && m.kind !== 'fate' && m.kind !== 'defeat') closeModal();
   }
 
   function handleWorld(now, move, presses, chargeHeld) {
@@ -246,8 +310,10 @@ export function startGame(canvas, seed, options = {}, initialWorld = null) {
     if (presses.dodge) { dodgeUntil = now + DODGE_MS; toast('Dodge!'); }
 
     if (move.dx || move.dy) {
+      view.facing = move.dy > 0 ? 'down' : move.dy < 0 ? 'up' : move.dx > 0 ? 'right' : 'left';
+      if (now >= nextWalkFrameAt) { view.walkFrame = 1 - view.walkFrame; nextWalkFrameAt = now + WALK_FRAME_MS; }
       if (now >= nextMoveAt) { dispatch({ type: 'MOVE', dx: move.dx, dy: move.dy }); nextMoveAt = now + MOVE_REPEAT_MS; }
-    } else { nextMoveAt = 0; }
+    } else { nextMoveAt = 0; view.walkFrame = 0; }
 
     if (presses.attack) {
       const id = nearest(world.enemies, 1, (en) => en.alive);
@@ -255,8 +321,14 @@ export function startGame(canvas, seed, options = {}, initialWorld = null) {
     }
     if (presses.blast) {
       const id = nearest(world.enemies, 3, (en) => en.alive);
-      if (id) dispatch({ type: 'AURA_BLAST', enemyId: id }); else toast('No enemy in range');
+      if (id) {
+        const target = world.enemies[id];
+        const x0 = world.player.x, y0 = world.player.y;
+        dispatch({ type: 'AURA_BLAST', enemyId: id });
+        view.projectiles.push({ x0, y0, x1: target.x, y1: target.y, start: now, duration: 180 });
+      } else toast('No enemy in range');
     }
+    view.charging = chargeHeld;
     if (chargeHeld) {
       if (!wasCharging || now >= nextChargeAt) { dispatch({ type: 'CHARGE', start: !wasCharging }); nextChargeAt = now + CHARGE_TICK_MS; }
     }
@@ -273,8 +345,6 @@ export function startGame(canvas, seed, options = {}, initialWorld = null) {
       else toast('Nothing here');
     }
 
-    // Enemy AI: adjacent living enemies strike on cooldown — unless the player
-    // is inside the dodge window (that withholding IS the i-frames).
     const dodging = now < dodgeUntil;
     if (!dodging) {
       for (const id of Object.keys(world.enemies).sort()) {
@@ -287,37 +357,38 @@ export function startGame(canvas, seed, options = {}, initialWorld = null) {
     if (now >= nextTickAt) { dispatch({ type: 'TICK' }); nextTickAt = now + TICK_MS; }
   }
 
-  // The guide line: the next incomplete beat, in order. One hint at a time.
   function computeGuide() {
     if (world.flags.ended) return '';
     const g = CONTENT.arc.guide;
-    const q = 'mend-the-sky';
-    const talkedSable = world.quests.offered[q] || world.quests.active[q] || world.quests.completed[q];
-    if (!talkedSable) return g.talk;
-    if (world.quests.offered[q]) return g.quest;
+    if (!(world.quests.offered['hear-the-world'] || world.quests.active['hear-the-world'] || world.quests.completed['hear-the-world'])) return g.talk;
+    if (world.quests.offered['hear-the-world']) return g.talk;
+    if (world.quests.active['hear-the-world']) return g.hear;
+    const doneCount = world.flags.revealOrder.length;
     if (world.arc.bossDefeated && !world.arc.complete) return g.choice;
     if (world.arc.complete) return g.gate;
     if (world.arc.bossSpawned) return g.boss;
-    if (world.quests.completed[q]) return g.rift;
-    if (!world.flags.audio && world.wells.resonance && !world.wells.resonance.attuned) return g.resonance;
-    if (!world.visual.color) return g.color;
-    const lensDone = world.player.inventory.includes('lens-shard');
-    if (!world.visual.light) return g.light;
-    if (!lensDone) return g.collect;
-    if (!world.visual.depth) return g.depth;
-    return g.rift;
+    if (world.quests.completed['mend-the-sky-finale']) return g.rift;
+    if (world.quests.active['mend-the-sky-finale']) {
+      if (!world.visual.light) return g.light;
+      return g.rift;
+    }
+    if (doneCount === 3) return g.finale;
+    if (Object.keys(world.quests.active).some((q) => q.startsWith('reveal-'))) return g.attune;
+    if (doneCount === 0) return g.choose1;
+    if (doneCount === 1) return g.choose2;
+    return g.choose3;
   }
 
   function frame(now) {
     const dt = Math.min(now - last || 16, MAX_FRAME_MS);
     last = now; frameNow = now;
 
-    const { move, presses, device, chargeHeld } = input.poll();
+    const { move, presses, device, chargeHeld, blastHeld } = input.poll();
     view.device = input.hasTouch && device === 'keyboard' ? 'touch' : device;
 
     const frozen = now < hitStopUntil;
     if (!frozen) {
-      if (view.modal) handleModal(presses, move);
+      if (view.modal) handleModal(now, presses, move, blastHeld);
       else handleWorld(now, move, presses, chargeHeld);
     }
     lastModalDy = move.dy;
@@ -330,6 +401,7 @@ export function startGame(canvas, seed, options = {}, initialWorld = null) {
     view.dodging = now < dodgeUntil;
     for (const t of view.toasts) t.ttl -= dt;
     view.toasts = view.toasts.filter((t) => t.ttl > 0);
+    view.projectiles = view.projectiles.filter((p) => now - p.start < p.duration);
 
     if (now < shakeUntil) {
       const span = Math.max(1, shakeUntil - shakeStart);
@@ -344,8 +416,9 @@ export function startGame(canvas, seed, options = {}, initialWorld = null) {
     }
     view.playerPunch = Math.max(0, Math.min(1, (playerPunchUntil - now) / PLAYER_PUNCH_MS));
     view.night = nightAmount(world.tick);
+    if (view.kaleidoscope && now >= view.kaleidoscope.until) view.kaleidoscope = null;
 
-    input.setZones(render(ctx, ro, view));
+    input.setZones(render(ctx, ro, view, now));
     requestAnimationFrame(frame);
   }
   requestAnimationFrame(frame);

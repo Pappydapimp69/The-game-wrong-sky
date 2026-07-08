@@ -4,20 +4,11 @@
 // The world is BUILT FROM CONTENT (src/sim/content.js) — definitions are
 // copied into state at construction so a running save never shifts under a
 // content edit. Authoritative fields are integers only.
-//
-// WRONG SKY additions over the Prologue engine:
-//   - `visual` facets (color/light/depth) — authoritative progression the
-//     renderer reads to decide how much of the world to draw; restored by
-//     attuning wells.
-//   - `wells` — the signature interactable; quest-gated ones follow the same
-//     "don't exist until accepted" rule as gated enemies/pickups (E9).
-//   - `options.saga` — an imported saga.v1 carryover (archetype/skills/choice)
-//     applied on a fresh start, so a Prologue run continues here.
 
 import { makeRng } from './rng.js';
 import { CONTENT } from './content.js';
 
-export const WORLD_VERSION = 'wrongsky1';
+export const WORLD_VERSION = 'wrongsky2';
 
 export function makeWorld(seed, options = {}) {
   if (!Number.isInteger(seed)) throw new Error('makeWorld: seed must be an integer');
@@ -29,9 +20,6 @@ export function makeWorld(seed, options = {}) {
 
   const regionDef = CONTENT.regions[CONTENT.startRegion];
 
-  // Skills start from the archetype template. A saga carryover raises any skill
-  // to at least the level it reached in the Prologue (never lowers it) — growth
-  // survives between games.
   const carrySkills = (options.saga && options.saga.skills) || {};
   const skills = {};
   for (const s of ['melee', 'aura', 'perception']) {
@@ -40,12 +28,13 @@ export function makeWorld(seed, options = {}) {
     skills[s] = { lvl: Math.max(base, carried), xp: 0 };
   }
 
-  // Quest-gated entities/wells don't exist in the world until their quest is
-  // accepted (ACCEPT_QUEST spawns them — see reduce.js), so objectives stay
-  // agnostic of whatever the player did before accepting (Prologue lesson E9).
+  // Quest-gated ENEMIES/PICKUPS don't exist until their quest is accepted
+  // (E9) — objectives stay agnostic of prior actions. WELLS are different:
+  // they are always present (see reduce.js ATTUNE) — only their EFFECT is
+  // gated on the active quest, so a player can wander to any well early and
+  // get a vague hint instead of a hard "doesn't exist" wall.
   const gatedEnemyIds = new Set(Object.values(CONTENT.quests).flatMap((q) => q.unlocks?.enemies || []));
   const gatedPickupIds = new Set(Object.values(CONTENT.quests).flatMap((q) => q.unlocks?.pickups || []));
-  const gatedWellIds = new Set(Object.values(CONTENT.quests).flatMap((q) => q.unlocks?.wells || []));
 
   const enemies = {};
   for (const [id, e] of Object.entries(regionDef.enemies)) {
@@ -53,7 +42,7 @@ export function makeWorld(seed, options = {}) {
     const kind = CONTENT.enemyKinds[e.kind];
     enemies[id] = {
       x: e.x, y: e.y, kind: e.kind, hp: kind.hp, maxHp: kind.hp, power: kind.power, alive: 1,
-      immune: kind.immune || '', // '' = no immunity, same "no value" convention as arc.choice
+      immune: kind.immune || '',
     };
   }
   const npcs = {};
@@ -73,20 +62,18 @@ export function makeWorld(seed, options = {}) {
   }
   const wells = {};
   for (const [id, wl] of Object.entries(regionDef.wells || {})) {
-    if (gatedWellIds.has(id)) continue;
     wells[id] = { x: wl.x, y: wl.y, grants: wl.grants, attuned: 0 };
   }
-  const blocked = {};
-  for (const b of regionDef.blocked) blocked[b] = 1;
+  // Opacity per blocked tile (0-100): how strongly it occludes light/sight.
+  // Collision is a separate concern (any entry blocks MOVE regardless of
+  // magnitude) — this is the visibility system's input (src/sim/visibility.js).
+  const blocked = { ...regionDef.blocked };
 
-  // Quest defs carry their own unlock TEMPLATES (copied from content at
-  // construction, like everything else) so reduce.js can spawn them on accept
-  // without importing CONTENT — state stays a self-contained copy.
   const questDefs = {};
   for (const [qid, q] of Object.entries(CONTENT.quests)) {
     const def = JSON.parse(JSON.stringify(q));
     if (q.unlocks) {
-      def.unlocks = { enemies: {}, pickups: {}, wells: {} };
+      def.unlocks = { enemies: {}, pickups: {} };
       for (const id of q.unlocks.enemies || []) {
         const e = regionDef.enemies[id];
         const kind = CONTENT.enemyKinds[e.kind];
@@ -98,10 +85,6 @@ export function makeWorld(seed, options = {}) {
       for (const id of q.unlocks.pickups || []) {
         const p = regionDef.pickups[id];
         def.unlocks.pickups[id] = { x: p.x, y: p.y, item: p.item, taken: 0 };
-      }
-      for (const id of q.unlocks.wells || []) {
-        const wl = regionDef.wells[id];
-        def.unlocks.wells[id] = { x: wl.x, y: wl.y, grants: wl.grants, attuned: 0 };
       }
     }
     questDefs[qid] = def;
@@ -118,7 +101,7 @@ export function makeWorld(seed, options = {}) {
       x: regionDef.spawn.x, y: regionDef.spawn.y,
       hp: arch.hp, maxHp: arch.hp,
       aura: 0, maxAura: arch.aura,
-      chargeHold: 0, // consecutive CHARGE ticks in the current hold — see reduce.js
+      chargeHold: 0,
       coins: 0,
       skills,
       inventory: [],
@@ -136,15 +119,11 @@ export function makeWorld(seed, options = {}) {
     wells,
     items,
     quests: { defs: questDefs, offered: {}, active: {}, completed: {} },
-    // The signature progression: three visual facets the world has lost and the
-    // player restores by attuning wells. Authoritative integers (0/1), saved
-    // and fingerprinted. HOW a restored facet looks is presentation — the
+    // The signature progression: which rendering LAYERS have been restored.
+    // Authoritative integers (0/1), saved and fingerprinted. HOW a restored
+    // layer looks (sprites, shadows, hue-cycle reveal) is presentation — the
     // renderer reads these and never writes them.
-    visual: { color: 0, light: 0, depth: 0 },
-    // The finale arc: the rival ("the Second") crests the rift once the sky is
-    // mended and the player reaches its edge. A state overlay that OBSERVES
-    // gameplay events; the boss definition is copied in so the sim stays
-    // self-contained. No teaching steps here — game 2 assumes the verbs.
+    visual: { player: 0, world: 0, enemies: 0, light: 0 },
     arc: {
       bossDef: {
         ...regionDef.boss,
@@ -156,12 +135,14 @@ export function makeWorld(seed, options = {}) {
       choice: '', // '', 'spare', 'claim'
       complete: 0,
     },
-    // flags: audio (resonance well attuned), ended (chapter over), and the
-    // remembered Prologue choice (a dialog beat, and it re-exports in saga.v2).
     flags: {
       audio: 0,
       ended: 0,
       ravagerFate: (options.saga && options.saga.choices && options.saga.choices.ravagerFate) || '',
+      // Ordered list of {player,world,enemies} facets as their reveal quests
+      // complete — drives the branching narrative (order-sensitive, not just
+      // which were picked). Never mutated except by appending.
+      revealOrder: [],
     },
   };
 }

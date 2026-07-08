@@ -9,7 +9,7 @@
 //   3. completability — every quest objective is achievable in its world
 // Rung 4 is the headless demo playthrough in the smoke suite.
 
-const FACETS = ['color', 'light', 'depth', 'audio'];
+const FACETS = ['player', 'world', 'enemies', 'light', 'audio'];
 
 export function validateContent(c) {
   const errors = [];
@@ -44,11 +44,12 @@ export function validateContent(c) {
     if (!isInt(r.w) || !isInt(r.h) || r.w < 4 || r.h < 4) err(`region ${rid}: bad size`);
     const inBounds = (x, y) => isInt(x) && isInt(y) && x >= 0 && y >= 0 && x < r.w && y < r.h;
     if (!r.spawn || !inBounds(r.spawn.x, r.spawn.y)) err(`region ${rid}: spawn out of bounds`);
-    for (const b of r.blocked || []) {
+    for (const [b, op] of Object.entries(r.blocked || {})) {
       const [x, y] = String(b).split(',').map(Number);
       if (!inBounds(x, y)) err(`region ${rid}: blocked tile ${b} out of bounds`);
+      if (!isInt(op) || op < 0 || op > 100) err(`region ${rid}: blocked tile ${b} bad opacity ${op} (must be 0-100)`);
     }
-    const blockedSet = new Set(r.blocked || []);
+    const blockedSet = new Set(Object.keys(r.blocked || {}));
     const placed = (kind, id, e) => {
       if (!inBounds(e.x, e.y)) err(`region ${rid}: ${kind} ${id} out of bounds`);
       else if (blockedSet.has(`${e.x},${e.y}`)) err(`region ${rid}: ${kind} ${id} on a blocked tile`);
@@ -60,6 +61,7 @@ export function validateContent(c) {
     for (const [id, wl] of Object.entries(r.wells || {})) {
       placed('well', id, wl);
       if (!FACETS.includes(wl.grants)) err(`region ${rid}: well ${id} grants unknown facet ${wl.grants}`);
+      if (!wl.hint || typeof wl.hint !== 'string') err(`region ${rid}: well ${id} missing a hint string`);
     }
     for (const [id, z] of Object.entries(r.zones || {})) {
       if (!inBounds(z.x, z.y)) err(`region ${rid}: zone ${id} out of bounds`);
@@ -71,15 +73,15 @@ export function validateContent(c) {
     if (!Array.isArray(q.objectives) || !q.objectives.length) err(`quest ${qid}: no objectives`);
     for (const [i, o] of (q.objectives || []).entries()) {
       if (!['kill', 'collect', 'reach', 'attune'].includes(o.type)) err(`quest ${qid}#${i}: unknown objective type ${o.type}`);
-      if (o.type === 'attune' && !['color', 'light', 'depth'].includes(o.facet)) err(`quest ${qid}#${i}: attune bad facet ${o.facet}`);
+      if (o.type === 'attune' && !FACETS.includes(o.facet)) err(`quest ${qid}#${i}: attune bad facet ${o.facet}`);
       if (o.n !== undefined && (!isInt(o.n) || o.n < 1)) err(`quest ${qid}#${i}: bad n`);
     }
     if (!q.reward || !isInt(q.reward.coins) || q.reward.coins < 0) err(`quest ${qid}: bad reward`);
+    for (const req of q.requires || []) {
+      if (!c.quests?.[req]) err(`quest ${qid}: requires unknown quest ${req}`);
+    }
   }
 
-  // Finale arc: the boss must be spawnable and every arc step must have a guide
-  // line (a step with no guidance is a silent dead-end). The rift's edge and
-  // gate zones must both exist.
   for (const [rid, r] of Object.entries(c.regions || {})) {
     if (rid !== c.startRegion) continue;
     if (!r.boss) { err(`region ${rid}: no boss for the finale`); continue; }
@@ -87,16 +89,32 @@ export function validateContent(c) {
     if (r.enemies?.[r.boss.id]) err(`region ${rid}: boss id ${r.boss.id} collides with a normal enemy`);
     const inB = (x, y) => isInt(x) && isInt(y) && x >= 0 && y >= 0 && x < r.w && y < r.h;
     if (!inB(r.boss.x, r.boss.y)) err(`region ${rid}: boss out of bounds`);
-    if ((r.blocked || []).includes(`${r.boss.x},${r.boss.y}`)) err(`region ${rid}: boss on blocked tile`);
+    if (r.blocked && Object.prototype.hasOwnProperty.call(r.blocked, `${r.boss.x},${r.boss.y}`)) err(`region ${rid}: boss on blocked tile`);
     if (!r.zones?.['rift-edge']) err(`region ${rid}: missing rift-edge zone`);
     if (!r.zones?.['rift-gate']) err(`region ${rid}: missing rift-gate exit zone`);
   }
-  const ARC_STEPS = ['talk', 'quest', 'resonance', 'color', 'light', 'depth', 'collect', 'rift', 'boss', 'choice', 'gate'];
+  const ARC_STEPS = ['talk', 'hear', 'choose1', 'choose2', 'choose3', 'attune', 'finale', 'light', 'rift', 'boss', 'choice', 'gate'];
   for (const step of ARC_STEPS) {
     if (!c.arc?.guide?.[step]) err(`arc: missing guide text for step ${step}`);
   }
   for (const block of ['intro', 'bossAppeared', 'bossTaunted', 'finale']) {
     if (!Array.isArray(c.arc?.[block]) || !c.arc[block].length) err(`arc: missing ${block} text`);
+  }
+  // Branching narrative: all 6 permutations of the 3 sprite facets must have
+  // text at each keyed stage, or a real playthrough hits a blank/undefined.
+  const PERMS = permutations(['player', 'world', 'enemies']);
+  if (!c.branch) err('missing arc.branch content');
+  else {
+    for (const p of ['player', 'world', 'enemies']) {
+      if (!c.branch.afterFirst?.[p]?.length) err(`branch.afterFirst missing text for ${p}`);
+      if (!c.branch.options?.[p]) err(`branch.options missing entry for ${p}`);
+    }
+    for (const perm of PERMS) {
+      const pair = perm.slice(0, 2).join(',');
+      if (!c.branch.afterSecond?.[pair]?.length) err(`branch.afterSecond missing text for ${pair}`);
+      const full = perm.join(',');
+      if (!c.branch.finale?.[full]?.length) err(`branch.finale missing text for ${full}`);
+    }
   }
 
   // --- rung 2: referential integrity ---------------------------------------
@@ -106,7 +124,6 @@ export function validateContent(c) {
   for (const [rid, r] of Object.entries(c.regions || {})) {
     for (const [id, n] of Object.entries(r.npcs || {})) {
       allNpcs[id] = { ...n, region: rid };
-      if (n.offers && !c.quests?.[n.offers]) err(`npc ${id}: offers unknown quest ${n.offers}`);
       for (const it of n.shop || []) {
         if (!c.items?.[it]) err(`npc ${id}: shop sells unknown item ${it}`);
         else if (c.items[it].price === undefined) err(`npc ${id}: shop item ${it} has no price`);
@@ -119,26 +136,18 @@ export function validateContent(c) {
       if (!c.items?.[p.item]) err(`pickup ${id}: unknown item ${p.item}`);
     }
   }
-  const allEnemyIds = new Set(), allPickupIds = new Set(), allWellIds = new Set();
+  const allEnemyIds = new Set(), allPickupIds = new Set();
   for (const r of Object.values(c.regions || {})) {
     for (const id of Object.keys(r.enemies || {})) allEnemyIds.add(id);
     for (const id of Object.keys(r.pickups || {})) allPickupIds.add(id);
-    for (const id of Object.keys(r.wells || {})) allWellIds.add(id);
   }
   for (const [qid, q] of Object.entries(c.quests || {})) {
     if (!allNpcs[q.giver]) err(`quest ${qid}: giver ${q.giver} does not exist`);
-    if (q.giver && allNpcs[q.giver] && allNpcs[q.giver].offers !== qid) {
-      // Not fatal, but a quest nobody offers is unreachable.
-      err(`quest ${qid}: no npc offers it (giver ${q.giver} offers ${allNpcs[q.giver].offers})`);
-    }
     for (const id of q.unlocks?.enemies || []) {
       if (!allEnemyIds.has(id)) err(`quest ${qid}: unlocks unknown enemy ${id}`);
     }
     for (const id of q.unlocks?.pickups || []) {
       if (!allPickupIds.has(id)) err(`quest ${qid}: unlocks unknown pickup ${id}`);
-    }
-    for (const id of q.unlocks?.wells || []) {
-      if (!allWellIds.has(id)) err(`quest ${qid}: unlocks unknown well ${id}`);
     }
   }
 
@@ -146,9 +155,6 @@ export function validateContent(c) {
   for (const [qid, q] of Object.entries(c.quests || {})) {
     for (const [i, o] of (q.objectives || []).entries()) {
       if (o.type === 'kill') {
-        // Each kill objective targets a specific kind; confirm enough of THAT
-        // kind are authored to satisfy `n`. Immunity changes which attack
-        // finishes a kind, not how many must exist.
         let count = 0;
         for (const r of Object.values(c.regions || {})) {
           for (const e of Object.values(r.enemies || {})) if (e.kind === o.target) count++;
@@ -179,6 +185,33 @@ export function validateContent(c) {
       }
     }
   }
+  // A quest chain must actually be reachable: every `requires` edge (ALL of
+  // them, not just the first) must bottom out at quests with no prereqs — no
+  // cycles, nothing permanently locked. DFS the full requires graph from each
+  // quest, not just its first prerequisite, or a cycle through a LATER
+  // requires entry ships undetected.
+  for (const qid of Object.keys(c.quests || {})) {
+    const path = new Set();
+    let cycle = false;
+    const visit = (cur, depth) => {
+      if (cycle || depth > 50) return;
+      if (path.has(cur)) { err(`quest ${qid}: requires-chain cycle detected at ${cur}`); cycle = true; return; }
+      path.add(cur);
+      for (const req of c.quests[cur]?.requires || []) visit(req, depth + 1);
+      path.delete(cur);
+    };
+    visit(qid, 0);
+  }
 
   return errors;
+}
+
+function permutations(arr) {
+  if (arr.length <= 1) return [arr];
+  const out = [];
+  for (let i = 0; i < arr.length; i++) {
+    const rest = [...arr.slice(0, i), ...arr.slice(i + 1)];
+    for (const p of permutations(rest)) out.push([arr[i], ...p]);
+  }
+  return out;
 }

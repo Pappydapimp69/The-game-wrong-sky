@@ -126,8 +126,11 @@ export function makeInput(canvas) {
     };
     // Charge is press-and-hold, not a one-shot action — expose the raw held
     // state (already continuous across keyboard/touch/gamepad in `down`)
-    // alongside the edge-triggered `presses`.
-    return { move, presses, device, chargeHeld: !!down.charge };
+    // alongside the edge-triggered `presses`. blastHeld is exposed the same
+    // way so single-button dialogs can require a deliberate hold-to-dismiss
+    // on blast/X — a button distinct from confirm/attack, which is what was
+    // causing accidental dismissal via combat mashing in the first place.
+    return { move, presses, device, chargeHeld: !!down.charge, blastHeld: !!down.blast };
   }
 
   return {

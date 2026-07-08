@@ -4,24 +4,29 @@
 // state. Returns this frame's touch/click zones so input hit-tests what was
 // drawn.
 //
-// WRONG SKY presentation pillars, all driven by the authoritative `visual`
-// facets the player restores by attuning wells:
-//   - color: the world is drawn GRAYSCALE until restored, then in full palette.
-//   - light: once restored, a darkness layer with pools of light around the
-//            player, the wells, and the rift (emissive) — walls stay opaque
-//            occluders you can't see through. Flat/washed before.
-//   - depth: once restored, entities are Y-SORTED with ground shadows so the
-//            scene reads as having real depth. Flat layer order before.
-// The camera follows the player and clamps to the region, so the world fills
-// the viewport at any resolution (fill-not-letterbox). HUD/text is anchored in
-// screen space with its OWN scale — world scale and text scale are separate on
-// purpose (Brain: test#E11, data-sized text drifts under a uniform world scale).
+// WRONG SKY presentation pillars, all driven by authoritative flags the player
+// restores by attuning wells:
+//   - visual.player / visual.world / visual.enemies: swap flat Phase-1 blocks
+//     for real pixel sprites, one layer at a time (src/app/sprites.js).
+//   - visual.light: opacity-based shadowcasting (src/sim/visibility.js) — a
+//     100-opacity wall fully occludes what's behind it from the player's line
+//     of sight; Y-sort + ground shadows read as real depth.
+//   - The light well ALSO fires a ~7s hue-cycle "kaleidoscope" (view.kaleidoscope)
+//     that melts whatever sprite layers are already on into their true color —
+//     grayscale until then, always.
+// The camera follows the player and clamps to the region so the world fills
+// the viewport at any resolution. HUD/text is anchored in screen space with
+// its OWN scale — world scale and text scale are separate on purpose.
 
 import { canSense, enemyReadout } from '../sim/info.js';
 import { withHint } from './device-labels.js';
 import { describeObjective } from './objective-text.js';
+import { computeVisibility } from '../sim/visibility.js';
+import { drawPixelSprite } from './pixelart.js';
+import { PLAYER_SPRITES, BLAST_SPRITE, ENEMY_SPRITES, TILE_SPRITES } from './sprites.js';
 
 export const TILE = 24;
+const VISION_RADIUS = 9;
 
 export const COLORS = {
   bg: '#05070f', ground: '#141a2e', grid: '#1b2340', wall: '#39436a',
@@ -31,39 +36,54 @@ export const COLORS = {
   well: '#b48cff', wellOn: '#e0d0ff', rival: '#ff6b8a', rift: '#8fd0ff',
 };
 
-// Grayscale twin of the palette (luminance), used until `color` is restored.
-// Precomputed once — cheap, and keeps the drained look one lookup away.
+// Grayscale twin of the palette (luminance), used until `world`/etc restore.
 const GRAY = {};
 for (const [k, hex] of Object.entries(COLORS)) GRAY[k] = toGray(hex);
 
-let lightLayer = null; // offscreen darkness canvas for the `light` facet
+// Sprite render filter for the current frame: grayscale until the light well
+// fires, then a ~7s hue-cycle melt into true color, then NONE forever after
+// (a resumed save where light was already attuned in a prior session also
+// gets 'none' immediately — kaleidoscope is a one-time reveal, not a re-tint).
+function spriteFilter(view, now, lightRestored) {
+  if (view.kaleidoscope) {
+    const t = Math.max(0, Math.min(1, (now - view.kaleidoscope.start) / (view.kaleidoscope.until - view.kaleidoscope.start)));
+    const eased = 1 - Math.pow(1 - t, 3); // ease-out
+    const hueDeg = Math.round((1 - eased) * 720); // a couple of full cycles, settling to 0
+    const gray = Math.max(0, 1 - eased);
+    return `grayscale(${gray.toFixed(2)}) hue-rotate(${hueDeg}deg)`;
+  }
+  return lightRestored ? 'none' : 'grayscale(1)';
+}
 
-export function render(ctx, w, view) {
+// Canvas 2D `filter` treats 'none' as an exclusive keyword — it cannot be
+// combined with other filter functions in one string ('none grayscale(...)'
+// is invalid and silently drops the whole filter). Combine safely instead.
+function combineFilter(base, extra) { return base === 'none' ? extra : `${base} ${extra}`; }
+
+export function render(ctx, w, view, now = 0) {
   const { canvas } = ctx;
   const W = canvas.width, H = canvas.height;
   const zones = [];
   const vis = w.visual;
-  const C = vis.color ? COLORS : GRAY; // active palette
+  // Flat (non-sprite) elements — wells, pickups, HUD — snap to true color the
+  // instant light is attuned; only the SPRITE layer (player/world/enemies)
+  // animates through the kaleidoscope, via `filter` below.
+  const C = vis.light ? COLORS : GRAY;
+  const filter = spriteFilter(view, now, vis.light);
 
-  // Background (a touch of cold even when "colored" — this sky is still wrong).
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.fillStyle = C.bg;
   ctx.fillRect(0, 0, W, H);
 
   // --- camera + world scale ------------------------------------------------
-  // Scale so ~16 tiles are visible tall; the width shows however many fit. The
-  // camera centers the player and clamps to the region so there are no black
-  // bars (the region is larger than the view in both axes).
   const scale = H / (16 * TILE);
   const regionWpx = w.region.w * TILE, regionHpx = w.region.h * TILE;
   const viewWpx = W / scale, viewHpx = H / scale;
   const centerX = view.px * TILE + TILE / 2, centerY = view.py * TILE + TILE / 2;
   const camX = clampCam(centerX - viewWpx / 2, regionWpx, viewWpx);
   const camY = clampCam(centerY - viewHpx / 2, regionHpx, viewHpx);
-  // World transform: world px -> screen px, plus screen-space shake.
   ctx.setTransform(scale, 0, 0, scale, -camX * scale + (view.shakeX || 0), -camY * scale + (view.shakeY || 0));
 
-  // Visible world-tile bounds (viewport culling — only draw what's on screen).
   const pad = 1;
   const minTX = Math.max(0, Math.floor(camX / TILE) - pad);
   const maxTX = Math.min(w.region.w - 1, Math.floor((camX + viewWpx) / TILE) + pad);
@@ -72,14 +92,27 @@ export function render(ctx, w, view) {
   const onScreen = (x, y) => x >= minTX - pad && x <= maxTX + pad && y >= minTY - pad && y <= maxTY + pad;
 
   // --- ground + grid (culled) ---
-  ctx.fillStyle = C.ground;
-  ctx.fillRect(minTX * TILE, minTY * TILE, (maxTX - minTX + 1) * TILE, (maxTY - minTY + 1) * TILE);
-  ctx.strokeStyle = C.grid;
-  ctx.lineWidth = 1;
-  for (let x = minTX; x <= maxTX + 1; x++) { ctx.beginPath(); ctx.moveTo(x * TILE, minTY * TILE); ctx.lineTo(x * TILE, (maxTY + 1) * TILE); ctx.stroke(); }
-  for (let y = minTY; y <= maxTY + 1; y++) { ctx.beginPath(); ctx.moveTo(minTX * TILE, y * TILE); ctx.lineTo((maxTX + 1) * TILE, y * TILE); ctx.stroke(); }
+  const worldSprites = vis.world;
+  if (worldSprites) {
+    for (let ty = minTY; ty <= maxTY; ty++) {
+      for (let tx = minTX; tx <= maxTX; tx++) {
+        const def = (tx + ty) % 2 === 0 ? TILE_SPRITES.groundA : TILE_SPRITES.groundB;
+        drawPixelSprite(ctx, def, tx * TILE, ty * TILE, TILE, filter);
+      }
+    }
+  } else {
+    ctx.fillStyle = C.ground;
+    ctx.fillRect(minTX * TILE, minTY * TILE, (maxTX - minTX + 1) * TILE, (maxTY - minTY + 1) * TILE);
+    ctx.strokeStyle = C.grid;
+    ctx.lineWidth = 1;
+    for (let x = minTX; x <= maxTX + 1; x++) { ctx.beginPath(); ctx.moveTo(x * TILE, minTY * TILE); ctx.lineTo(x * TILE, (maxTY + 1) * TILE); ctx.stroke(); }
+    for (let y = minTY; y <= maxTY + 1; y++) { ctx.beginPath(); ctx.moveTo(minTX * TILE, y * TILE); ctx.lineTo((maxTX + 1) * TILE, y * TILE); ctx.stroke(); }
+  }
 
-  const drawWall = (x, y) => { ctx.fillStyle = C.wall; ctx.fillRect(x * TILE, y * TILE, TILE, TILE); };
+  const drawWall = (x, y) => {
+    if (worldSprites) drawPixelSprite(ctx, TILE_SPRITES.wall, x * TILE, y * TILE, TILE, filter);
+    else { ctx.fillStyle = C.wall; ctx.fillRect(x * TILE, y * TILE, TILE, TILE); }
+  };
   const walls = [];
   for (const key of Object.keys(w.region.blocked)) {
     const [x, y] = key.split(',').map(Number);
@@ -87,9 +120,8 @@ export function render(ctx, w, view) {
   }
 
   // --- build the drawable list (entities) ---
-  // Each drawable knows its baseline y (feet) for Y-sorting and a draw fn.
   const drawables = [];
-  const add = (x, y, fn, opts = {}) => { if (onScreen(x, y)) drawables.push({ x, y, fn, glow: opts.glow || null }); };
+  const add = (x, y, fn) => { if (onScreen(x, y)) drawables.push({ x, y, fn }); };
 
   for (const id of Object.keys(w.destructibles)) {
     const d = w.destructibles[id];
@@ -109,28 +141,31 @@ export function render(ctx, w, view) {
       ctx.moveTo(x + TILE / 2, y + 5); ctx.lineTo(x + TILE - 5, y + TILE / 2);
       ctx.lineTo(x + TILE / 2, y + TILE - 5); ctx.lineTo(x + 5, y + TILE / 2);
       ctx.closePath(); ctx.fill();
-    }, { glow: C.pickup });
+    });
   }
   for (const id of Object.keys(w.wells)) {
     const wl = w.wells[id];
     add(wl.x, wl.y, () => {
       const [x, y] = tile(wl.x, wl.y);
       const cx = x + TILE / 2, cy = y + TILE / 2;
-      // Unattuned wells pulse a dim ring (a beacon: attention, then attune);
-      // attuned wells glow bright in their facet's spirit.
       ctx.strokeStyle = wl.attuned ? C.wellOn : C.well;
       ctx.lineWidth = wl.attuned ? 3 : 2;
       ctx.beginPath(); ctx.arc(cx, cy, TILE * 0.34, 0, Math.PI * 2); ctx.stroke();
       if (wl.attuned) { ctx.fillStyle = C.wellOn; ctx.beginPath(); ctx.arc(cx, cy, TILE * 0.16, 0, Math.PI * 2); ctx.fill(); }
       ctx.lineWidth = 1;
-    }, { glow: wl.attuned ? C.wellOn : null });
+    });
   }
+  const enemySprites = vis.enemies;
   for (const id of Object.keys(w.npcs)) {
     const n = w.npcs[id];
     add(n.x, n.y, () => {
       const [x, y] = tile(n.x, n.y);
-      ctx.fillStyle = C.npc;
-      ctx.fillRect(x + 5, y + 4, TILE - 10, TILE - 7);
+      if (enemySprites) {
+        drawPixelSprite(ctx, PLAYER_SPRITES['down-0'], x + 2, y + 2, TILE - 4, combineFilter(filter, 'grayscale(0.6) brightness(0.85)'));
+      } else {
+        ctx.fillStyle = C.npc;
+        ctx.fillRect(x + 5, y + 4, TILE - 10, TILE - 7);
+      }
       ctx.fillStyle = C.dim;
       ctx.font = '9px system-ui, sans-serif';
       ctx.textAlign = 'center';
@@ -144,8 +179,13 @@ export function render(ctx, w, view) {
     add(e.x, e.y, () => {
       const [x, y] = tile(e.x, e.y);
       const big = isBoss ? 5 : 0;
-      ctx.fillStyle = !e.alive ? C.dead : (isBoss ? C.rival : C.enemy);
-      fillSquashed(ctx, x + 5 - big, y + 5 - big, TILE - 10 + big * 2, TILE - 10 + big * 2, view.punch[id] || 0);
+      if (enemySprites && ENEMY_SPRITES[e.kind]) {
+        const f = e.alive ? filter : 'grayscale(1) brightness(0.4)';
+        drawPixelSprite(ctx, ENEMY_SPRITES[e.kind], x + 2 - big, y + 2 - big, TILE - 4 + big * 2, f);
+      } else {
+        ctx.fillStyle = !e.alive ? C.dead : (isBoss ? C.rival : C.enemy);
+        fillSquashed(ctx, x + 5 - big, y + 5 - big, TILE - 10 + big * 2, TILE - 10 + big * 2, view.punch[id] || 0);
+      }
       if (e.alive) {
         if (canSense(w.player, e.kind)) {
           ctx.fillStyle = C.bar; ctx.fillRect(x + 3, y - 6, TILE - 6, 3);
@@ -154,9 +194,9 @@ export function render(ctx, w, view) {
         ctx.fillStyle = C.dim; ctx.font = '8px system-ui, sans-serif'; ctx.textAlign = 'center';
         ctx.fillText(enemyReadout(w.player, e), x + TILE / 2, y - 9); ctx.textAlign = 'left';
       }
-    }, { glow: isBoss && e.alive ? C.rival : null });
+    });
   }
-  // Player (smooth display position).
+  // Player (smooth display position, direction/frame-aware sprite).
   const ppx = view.px * TILE, ppy = view.py * TILE;
   add(view.px, view.py, () => {
     if (w.player.aura > 0) {
@@ -166,15 +206,27 @@ export function render(ctx, w, view) {
       ctx.globalAlpha = 1;
     }
     if (view.dodging) ctx.globalAlpha = 0.45;
-    ctx.fillStyle = C.player;
-    fillSquashed(ctx, ppx + 4, ppy + 4, TILE - 8, TILE - 8, view.playerPunch || 0, true);
+    if (vis.player) {
+      const key = view.charging ? 'charge' : `${view.facing === 'left' || view.facing === 'right' ? 'side' : view.facing}-${view.walkFrame}`;
+      const def = PLAYER_SPRITES[key] || PLAYER_SPRITES['down-0'];
+      if (view.facing === 'right') {
+        ctx.save();
+        ctx.translate(ppx + TILE, ppy);
+        ctx.scale(-1, 1);
+        drawPixelSprite(ctx, def, 0, 0, TILE, filter);
+        ctx.restore();
+      } else {
+        drawPixelSprite(ctx, def, ppx, ppy, TILE, filter);
+      }
+    } else {
+      ctx.fillStyle = C.player;
+      fillSquashed(ctx, ppx + 4, ppy + 4, TILE - 8, TILE - 8, view.playerPunch || 0, true);
+    }
     ctx.globalAlpha = 1;
-  }, { glow: w.player.aura > 0 ? C.aura : C.player });
+  });
 
-  // Depth facet: Y-sort so nearer (higher y) entities overlap farther ones, and
-  // give each a ground shadow. Without it, a flat, stable draw order and no
-  // shadows — the world reads as paper-flat until depth is restored.
-  if (vis.depth) {
+  // Depth facet: Y-sort + ground shadows.
+  if (vis.light) {
     drawables.sort((a, b) => (a.y - b.y) || (a.x - b.x));
     for (const d of drawables) {
       const [x, y] = tile(d.x, d.y);
@@ -184,31 +236,41 @@ export function render(ctx, w, view) {
   }
   for (const d of drawables) d.fn();
 
-  // Light facet: dark everywhere except pools around the player, attuned wells,
-  // the boss, and the rift edge (emissive). Walls are redrawn opaque on top so
-  // they read as solid occluders. Skipped entirely until `light` is restored.
+  // Blast projectiles: presentation-only, lerped between cast and target.
+  if (vis.player) {
+    for (const p of view.projectiles) {
+      const t = Math.max(0, Math.min(1, (now - p.start) / p.duration));
+      const px = (p.x0 + (p.x1 - p.x0) * t) * TILE + TILE / 2;
+      const py = (p.y0 + (p.y1 - p.y0) * t) * TILE + TILE / 2;
+      drawPixelSprite(ctx, BLAST_SPRITE, px - TILE * 0.3, py - TILE * 0.3, TILE * 0.6, filter);
+    }
+  }
+
+  // Light facet: opacity-based shadowcasting from the player's line of sight.
+  // A 100-opacity wall fully occludes what's behind it; walls are redrawn
+  // opaque on top so they still read as solid, visible occluders.
   if (vis.light) {
-    const sources = [{ x: view.px, y: view.py, r: 4.2 }];
-    for (const id of Object.keys(w.wells)) { const wl = w.wells[id]; if (wl.attuned && onScreen(wl.x, wl.y)) sources.push({ x: wl.x, y: wl.y, r: 2.6 }); }
-    const edge = w.region.zones['rift-edge']; if (edge) sources.push({ x: edge.x, y: edge.y, r: 3.2 });
-    for (const id of Object.keys(w.enemies)) { const e = w.enemies[id]; if (e.alive && id === w.arc.bossDef.id && onScreen(e.x, e.y)) sources.push({ x: e.x, y: e.y, r: 2.6 }); }
-    drawLight(ctx, W, H, scale, camX, camY, view, sources);
-    // walls stay solid through the dark
+    const originX = Math.round(view.px), originY = Math.round(view.py);
+    const clarity = computeVisibility(w, originX, originY, VISION_RADIUS);
+    for (let ty = minTY; ty <= maxTY; ty++) {
+      for (let tx = minTX; tx <= maxTX; tx++) {
+        const c = clarity.has(`${tx},${ty}`) ? clarity.get(`${tx},${ty}`) : 0;
+        if (c >= 100) continue;
+        ctx.fillStyle = `rgba(3,5,14,${(1 - c / 100) * 0.92})`;
+        ctx.fillRect(tx * TILE, ty * TILE, TILE, TILE);
+      }
+    }
     for (const [x, y] of walls) drawWall(x, y);
   }
 
-  // Dusk/night: the integer world clock raises enemy aggression (daynight.js);
-  // a faint screen-space tint so that pressure reads visually. Light-restored
-  // scenes are already dark, so ease it down there. Drawn over the world but
-  // under the HUD (which follows), so text stays readable.
+  // --- HUD (screen space, its own scale) -----------------------------------
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   if (view.night > 0.05) {
     ctx.fillStyle = `rgba(8,12,34,${(view.night * (vis.light ? 0.16 : 0.34)).toFixed(3)})`;
     ctx.fillRect(0, 0, W, H);
   }
 
-  // --- HUD (screen space, its own scale) -----------------------------------
-  const u = clamp(H / 540, 0.85, 3); // ui scale — anchored to height, NOT world scale
+  const u = clamp(H / 540, 0.85, 3);
   ctx.textAlign = 'left';
   const pad2 = 12 * u;
 
@@ -220,8 +282,7 @@ export function render(ctx, w, view) {
   const sk = w.player.skills;
   ctx.fillText(`Melee ${sk.melee.lvl} · Aura ${sk.aura.lvl} · Per ${sk.perception.lvl}`, pad2 + 162 * u, pad2 + 28 * u);
 
-  // Facet status — what the world has remembered so far.
-  const facets = [['color', vis.color], ['light', vis.light], ['depth', vis.depth], ['sound', w.flags.audio]];
+  const facets = [['self', vis.player], ['world', vis.world], ['others', vis.enemies], ['light', vis.light], ['sound', w.flags.audio]];
   ctx.font = `${11 * u}px system-ui, sans-serif`;
   let fx = pad2;
   const fy = pad2 + 44 * u;
@@ -232,7 +293,6 @@ export function render(ctx, w, view) {
     fx += (name.length * 7 + 16) * u;
   }
 
-  // Quest tracker (top-right).
   const activeIds = Object.keys(w.quests.active).sort();
   if (activeIds.length) {
     ctx.textAlign = 'right';
@@ -252,13 +312,11 @@ export function render(ctx, w, view) {
     ctx.textAlign = 'left';
   }
 
-  // Arc guide (top center, one line).
   if (view.guide) {
     ctx.fillStyle = COLORS.pickup; ctx.font = `italic ${13 * u}px system-ui, sans-serif`; ctx.textAlign = 'center';
     ctx.fillText(view.guide, W / 2, pad2 + 6 * u); ctx.textAlign = 'left';
   }
 
-  // Toasts (bottom-left).
   ctx.font = `${12 * u}px system-ui, sans-serif`;
   view.toasts.forEach((t, i) => {
     ctx.globalAlpha = Math.max(0, Math.min(1, t.ttl / 600));
@@ -267,7 +325,6 @@ export function render(ctx, w, view) {
   });
   ctx.globalAlpha = 1;
 
-  // Control legend (bottom).
   ctx.fillStyle = COLORS.dim; ctx.font = `${11 * u}px system-ui, sans-serif`;
   const legends = {
     keyboard: 'Move WASD · Attack J · Blast K · Charge L · Interact E · Items I · Dodge Space',
@@ -276,7 +333,6 @@ export function render(ctx, w, view) {
   };
   ctx.fillText(legends[view.device] || legends.keyboard, pad2, H - 10 * u);
 
-  // --- touch controls ------------------------------------------------------
   if (view.device === 'touch') {
     const dz = 42 * u, cx = 70 * u, cy = H - 92 * u;
     const dirs = [
@@ -295,7 +351,6 @@ export function render(ctx, w, view) {
     });
   }
 
-  // --- modal ---------------------------------------------------------------
   if (view.modal) zones.push(...drawModal(ctx, W, H, u, view));
 
   return zones;
@@ -303,45 +358,9 @@ export function render(ctx, w, view) {
   function tile(x, y) { return [x * TILE, y * TILE]; }
 }
 
-// --- lighting ---------------------------------------------------------------
-// Offscreen darkness layer with radial holes punched at light sources; drawn
-// over the world so lit pools reveal it and everything else falls dark. A cheap
-// stand-in for full shadow-casting — walls are redrawn opaque by the caller so
-// they still read as things you cannot see through.
-function drawLight(ctx, W, H, scale, camX, camY, view, sources) {
-  if (!lightLayer || lightLayer.width !== W || lightLayer.height !== H) {
-    lightLayer = (typeof document !== 'undefined') ? document.createElement('canvas') : null;
-    if (lightLayer) { lightLayer.width = W; lightLayer.height = H; }
-  }
-  if (!lightLayer) return;
-  const lc = lightLayer.getContext('2d');
-  lc.setTransform(1, 0, 0, 1, 0, 0);
-  lc.clearRect(0, 0, W, H);
-  lc.fillStyle = 'rgba(3,5,14,0.72)';
-  lc.fillRect(0, 0, W, H);
-  lc.globalCompositeOperation = 'destination-out';
-  for (const s of sources) {
-    const sx = (s.x * TILE + TILE / 2 - camX) * scale + (view.shakeX || 0);
-    const sy = (s.y * TILE + TILE / 2 - camY) * scale + (view.shakeY || 0);
-    const r = s.r * TILE * scale;
-    const g = lc.createRadialGradient(sx, sy, r * 0.15, sx, sy, r);
-    g.addColorStop(0, 'rgba(0,0,0,1)');
-    g.addColorStop(0.7, 'rgba(0,0,0,0.7)');
-    g.addColorStop(1, 'rgba(0,0,0,0)');
-    lc.fillStyle = g;
-    lc.beginPath(); lc.arc(sx, sy, r, 0, Math.PI * 2); lc.fill();
-  }
-  lc.globalCompositeOperation = 'source-over';
-  // Blit in screen space, but SAVE/RESTORE so the caller's world transform is
-  // intact afterward — the caller redraws the wall occluders in world coords
-  // right after this returns.
-  ctx.save();
-  ctx.setTransform(1, 0, 0, 1, 0, 0);
-  ctx.drawImage(lightLayer, 0, 0);
-  ctx.restore();
-}
-
 // --- modal ------------------------------------------------------------------
+// Uniform navigable options list, no default selection. Exactly one option
+// shows a press-and-hold progress bar instead of a highlight (see game.js).
 function drawModal(ctx, W, H, u, view) {
   const zones = [];
   const m = view.modal;
@@ -349,36 +368,8 @@ function drawModal(ctx, W, H, u, view) {
   ctx.fillRect(0, 0, W, H);
   ctx.textAlign = 'center';
 
-  if (m.kind === 'inventory') {
-    ctx.fillStyle = COLORS.text; ctx.font = `bold ${17 * u}px system-ui, sans-serif`;
-    ctx.fillText('Satchel', W / 2, H * 0.22);
-    const items = m.items; // [{id, name, count, usable}]
-    if (!items.length) {
-      ctx.fillStyle = COLORS.dim; ctx.font = `${13 * u}px system-ui, sans-serif`;
-      ctx.fillText('Empty. The Reach has given you nothing yet.', W / 2, H * 0.22 + 40 * u);
-    } else {
-      items.forEach((it, i) => {
-        const bw = 300 * u, bh = 34 * u, x = W / 2 - bw / 2, y = H * 0.22 + 24 * u + i * (bh + 8 * u);
-        const on = i === m.sel;
-        ctx.fillStyle = 'rgba(136,146,176,0.16)';
-        ctx.strokeStyle = on ? COLORS.pickup : 'rgba(136,146,176,0.5)';
-        ctx.lineWidth = on ? 2 : 1; ctx.fillRect(x, y, bw, bh); ctx.strokeRect(x, y, bw, bh); ctx.lineWidth = 1;
-        ctx.fillStyle = COLORS.text; ctx.font = `${13 * u}px system-ui, sans-serif`; ctx.textAlign = 'left';
-        ctx.fillText(`${it.name}${it.count > 1 ? ` ×${it.count}` : ''}`, x + 12 * u, y + bh / 2 + 4 * u);
-        ctx.textAlign = 'right'; ctx.fillStyle = it.usable ? COLORS.good : COLORS.dim;
-        ctx.fillText(it.usable ? 'use' : 'key item', x + bw - 12 * u, y + bh / 2 + 4 * u);
-        ctx.textAlign = 'center';
-        zones.push({ id: `item:${it.id}`, x, y, w: bw, h: bh });
-      });
-    }
-    ctx.fillStyle = COLORS.dim; ctx.font = `${11 * u}px system-ui, sans-serif`;
-    ctx.fillText(withHint(view.device, 'cancel', 'Close'), W / 2, H * 0.82);
-    ctx.textAlign = 'left';
-    return zones;
-  }
-
-  const lines = m.lines || [];
   ctx.fillStyle = COLORS.text; ctx.font = `bold ${17 * u}px system-ui, sans-serif`;
+  const lines = m.lines || [];
   const startY = Math.max(60 * u, H / 2 - (lines.length * 20 * u + 80 * u) / 2);
   ctx.fillText(m.title, W / 2, startY);
   let ly = startY + 30 * u;
@@ -388,11 +379,42 @@ function drawModal(ctx, W, H, u, view) {
     ctx.fillText(line, W / 2, ly, W - 48 * u);
     ly += 20 * u;
   }
-  (m.buttons || []).forEach((b, i) => {
-    const bw = 190 * u, bh = 34 * u, x = W / 2 - bw / 2, y = ly + 12 * u + i * 44 * u;
-    const label = withHint(view.device, b.hintAction || b.id, b.label);
-    zones.push(touchBtn(ctx, { id: b.id, label, x, y, w: bw, h: bh }, u));
-  });
+  ly += 12 * u;
+
+  const opts = m.options;
+  if (opts.length === 1) {
+    const bw = 220 * u, bh = 38 * u, x = W / 2 - bw / 2, y = ly;
+    ctx.fillStyle = 'rgba(136,146,176,0.16)';
+    ctx.strokeStyle = 'rgba(136,146,176,0.6)';
+    ctx.fillRect(x, y, bw, bh); ctx.strokeRect(x, y, bw, bh);
+    if (m.holdProgress > 0) {
+      ctx.fillStyle = 'rgba(143,240,166,0.35)';
+      ctx.fillRect(x, y, bw * m.holdProgress, bh);
+    }
+    ctx.fillStyle = COLORS.text; ctx.font = `bold ${13 * u}px system-ui, sans-serif`;
+    // Touch dismisses on a plain tap (no hold tracked for it); keyboard/gamepad
+    // require the deliberate hold. The dismiss control is ALWAYS blast — a
+    // single-option modal never reads `opt.hintAction` here, since holding
+    // confirm/cancel (whatever a caller may have set) does nothing.
+    const label = view.device === 'touch'
+      ? `Tap to ${opts[0].label}`
+      : withHint(view.device, 'blast', `Hold to ${opts[0].label}`);
+    ctx.fillText(label, x + bw / 2, y + bh / 2 + 5 * u);
+    zones.push({ id: opts[0].id, x, y, w: bw, h: bh });
+  } else {
+    opts.forEach((opt, i) => {
+      const bw = 260 * u, bh = 34 * u, x = W / 2 - bw / 2, y = ly + i * (bh + 8 * u);
+      const on = m.sel === i;
+      ctx.fillStyle = 'rgba(136,146,176,0.16)';
+      ctx.strokeStyle = on ? COLORS.pickup : 'rgba(136,146,176,0.5)';
+      ctx.lineWidth = on ? 2 : 1;
+      ctx.fillRect(x, y, bw, bh); ctx.strokeRect(x, y, bw, bh); ctx.lineWidth = 1;
+      ctx.fillStyle = COLORS.text; ctx.font = `${13 * u}px system-ui, sans-serif`;
+      const label = withHint(view.device, opt.hintAction || 'confirm', opt.label);
+      ctx.fillText(opt.usable === false ? `${opt.label} (key item)` : label, x + bw / 2, y + bh / 2 + 4 * u);
+      zones.push({ id: opt.id, x, y, w: bw, h: bh });
+    });
+  }
   ctx.textAlign = 'left';
   return zones;
 }
@@ -400,7 +422,7 @@ function drawModal(ctx, W, H, u, view) {
 // --- helpers ----------------------------------------------------------------
 function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
 function clampCam(v, worldSize, viewSize) {
-  if (worldSize <= viewSize) return (worldSize - viewSize) / 2; // center if region smaller than view
+  if (worldSize <= viewSize) return (worldSize - viewSize) / 2;
   return clamp(v, 0, worldSize - viewSize);
 }
 
@@ -429,12 +451,10 @@ function touchBtn(ctx, z, u = 1) {
   return z;
 }
 
-// Luminance grayscale of a #rrggbb — the drained look before `color` returns.
 function toGray(hex) {
   const n = parseInt(hex.slice(1), 16);
   const r = (n >> 16) & 255, g = (n >> 8) & 255, b = n & 255;
   const y = Math.round(0.299 * r + 0.587 * g + 0.114 * b);
-  // Nudge toward a cold slate so "drained" reads as eerie, not just gray.
   const cr = Math.round(y * 0.9), cg = Math.round(y * 0.95), cb = Math.min(255, Math.round(y * 1.08));
   return `#${((cr << 16) | (cg << 8) | cb).toString(16).padStart(6, '0')}`;
 }
