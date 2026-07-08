@@ -95,6 +95,14 @@ export function startGame(canvas, seed, options = {}, initialWorld = null) {
     return mkModal('dialog', title, lines, [{ id: optionId, label: label || 'Continue', hintAction: 'confirm' }]);
   }
 
+  // Shop text includes the live coin balance — must be rebuilt after a
+  // BUY/USE_ITEM or it goes stale while the modal (which fully covers the
+  // HUD behind it) stays open.
+  function shopLines(dialogLines, itemId) {
+    const item = world.items[itemId];
+    return [...dialogLines, `${item.name} — heals ${item.heal} HP — ${item.price} coins. You have ${world.player.coins}.`];
+  }
+
   function inventoryItems() {
     const counts = {};
     for (const id of world.player.inventory) counts[id] = (counts[id] || 0) + 1;
@@ -118,15 +126,14 @@ export function startGame(canvas, seed, options = {}, initialWorld = null) {
         const lines = CONTENT.regions[world.region.id].npcs[e.npc]?.dialog || [];
         if (npc.shop && npc.shop.length) {
           const itemId = npc.shop[0];
-          const item = world.items[itemId];
-          view.modal = mkModal('shop', npc.name,
-            [...lines, `${item.name} — heals ${item.heal} HP — ${item.price} coins. You have ${world.player.coins}.`],
+          view.modal = mkModal('shop', npc.name, shopLines(lines, itemId),
             [
-              { id: 'buy', label: `Buy ${item.name}` },
-              { id: 'drink', label: `Drink ${item.name}` },
+              { id: 'buy', label: `Buy ${world.items[itemId].name}` },
+              { id: 'drink', label: `Drink ${world.items[itemId].name}` },
               { id: 'leave', label: 'Leave', hintAction: 'cancel' },
             ]);
           view.modal.itemId = itemId;
+          view.modal.dialogLines = lines;
         } else if (!view.modal) {
           view.modal = mkDialog(npc.name, lines, 'close', 'Close');
         }
@@ -256,8 +263,8 @@ export function startGame(canvas, seed, options = {}, initialWorld = null) {
         else { dispatch({ type: 'ACCEPT_QUEST', questId: opt.id }); closeModal(); toast('Chosen.'); }
         break;
       case 'shop':
-        if (opt.id === 'buy') dispatch({ type: 'BUY', itemId: m.itemId });
-        else if (opt.id === 'drink') dispatch({ type: 'USE_ITEM', itemId: m.itemId });
+        if (opt.id === 'buy') { dispatch({ type: 'BUY', itemId: m.itemId }); m.lines = shopLines(m.dialogLines, m.itemId); }
+        else if (opt.id === 'drink') { dispatch({ type: 'USE_ITEM', itemId: m.itemId }); m.lines = shopLines(m.dialogLines, m.itemId); }
         else closeModal();
         break;
       case 'fate':
