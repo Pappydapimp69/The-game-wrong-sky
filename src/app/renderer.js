@@ -19,7 +19,7 @@
 // its OWN scale — world scale and text scale are separate on purpose.
 
 import { canSense, enemyReadout } from '../sim/info.js';
-import { withHint } from './device-labels.js';
+import { withHint, keyHint } from './device-labels.js';
 import { describeObjective } from './objective-text.js';
 import { computeVisibility } from '../sim/visibility.js';
 import { drawPixelSprite } from './pixelart.js';
@@ -393,15 +393,21 @@ function drawModal(ctx, W, H, u, view) {
     }
     ctx.fillStyle = COLORS.text; ctx.font = `bold ${13 * u}px system-ui, sans-serif`;
     // Touch dismisses on a plain tap (no hold tracked for it); keyboard/gamepad
-    // require the deliberate hold. The dismiss control is ALWAYS blast — a
-    // single-option modal never reads `opt.hintAction` here, since holding
-    // confirm/cancel (whatever a caller may have set) does nothing.
+    // require the deliberate hold. The dismiss control is ALWAYS blast —
+    // options don't carry their own key hint at all (see mkModal in game.js).
     const label = view.device === 'touch'
       ? `Tap to ${opts[0].label}`
       : withHint(view.device, 'blast', `Hold to ${opts[0].label}`);
     ctx.fillText(label, x + bw / 2, y + bh / 2 + 5 * u);
     zones.push({ id: opts[0].id, x, y, w: bw, h: bh });
   } else {
+    // No per-option key hint: every option (including a "not now"/"leave"
+    // choice) is selected the SAME way — navigate to it, then confirm — it
+    // is a choice like any other, not a button with its own dedicated key.
+    // Cancel/B is a separate GLOBAL shortcut that backs out of the whole
+    // dialog regardless of what's currently highlighted; it isn't "the
+    // button for this one option," so it gets one shared hint below the
+    // list instead of living on a single row.
     opts.forEach((opt, i) => {
       const bw = 260 * u, bh = 34 * u, x = W / 2 - bw / 2, y = ly + i * (bh + 8 * u);
       const on = m.sel === i;
@@ -410,10 +416,19 @@ function drawModal(ctx, W, H, u, view) {
       ctx.lineWidth = on ? 2 : 1;
       ctx.fillRect(x, y, bw, bh); ctx.strokeRect(x, y, bw, bh); ctx.lineWidth = 1;
       ctx.fillStyle = COLORS.text; ctx.font = `${13 * u}px system-ui, sans-serif`;
-      const label = withHint(view.device, opt.hintAction || 'confirm', opt.label);
-      ctx.fillText(opt.usable === false ? `${opt.label} (key item)` : label, x + bw / 2, y + bh / 2 + 4 * u);
+      ctx.fillText(opt.usable === false ? `${opt.label} (key item)` : opt.label, x + bw / 2, y + bh / 2 + 4 * u);
       zones.push({ id: opt.id, x, y, w: bw, h: bh });
     });
+    if (view.device !== 'touch') {
+      const upDown = keyHint(view.device, 'up') === keyHint(view.device, 'down')
+        ? keyHint(view.device, 'up') // e.g. gamepad: both are "D-Pad"
+        : `${keyHint(view.device, 'up')}/${keyHint(view.device, 'down')}`;
+      ctx.fillStyle = COLORS.dim; ctx.font = `${11 * u}px system-ui, sans-serif`;
+      ctx.fillText(
+        `${upDown} choose · ${keyHint(view.device, 'confirm')} select · ${keyHint(view.device, 'cancel')} back out`,
+        W / 2, ly + opts.length * (34 * u + 8 * u) + 16 * u,
+      );
+    }
   }
   ctx.textAlign = 'left';
   return zones;

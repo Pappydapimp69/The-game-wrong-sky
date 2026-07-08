@@ -86,13 +86,17 @@ export function startGame(canvas, seed, options = {}, initialWorld = null) {
   function closeModal() { view.modal = null; }
 
   // --- modal construction helpers -------------------------------------------
-  // Every modal is { kind, title, lines, options:[{id,label,hintAction?}], sel,
-  // holdStart, holdProgress }. `sel` starts null: nothing is pre-highlighted.
+  // Every modal is { kind, title, lines, options:[{id,label}], sel, holdStart,
+  // holdProgress }. `sel` starts null: nothing is pre-highlighted. No option
+  // carries its own key hint — every option in a 2+ list is chosen the SAME
+  // way (navigate, then confirm), and a lone option is always dismissed by
+  // holding blast (renderer.js hardcodes both, so a per-option hint field
+  // would just be unread data that can silently drift from the real control).
   function mkModal(kind, title, lines, options) {
     return { kind, title, lines, options, sel: null, holdStart: null, holdProgress: 0 };
   }
   function mkDialog(title, lines, optionId, label) {
-    return mkModal('dialog', title, lines, [{ id: optionId, label: label || 'Continue', hintAction: 'confirm' }]);
+    return mkModal('dialog', title, lines, [{ id: optionId, label: label || 'Continue' }]);
   }
 
   // Shop text includes the live coin balance — must be rebuilt after a
@@ -114,7 +118,7 @@ export function startGame(canvas, seed, options = {}, initialWorld = null) {
   function openInventory() {
     const items = inventoryItems();
     const options = items.map((it) => ({ id: `use:${it.id}`, label: `${it.name}${it.count > 1 ? ` x${it.count}` : ''}`, usable: it.usable }));
-    options.push({ id: 'close', label: 'Close', hintAction: 'cancel' });
+    options.push({ id: 'close', label: 'Close' });
     view.modal = mkModal('inventory', 'Satchel', [], options);
   }
 
@@ -130,7 +134,7 @@ export function startGame(canvas, seed, options = {}, initialWorld = null) {
             [
               { id: 'buy', label: `Buy ${world.items[itemId].name}` },
               { id: 'drink', label: `Drink ${world.items[itemId].name}` },
-              { id: 'leave', label: 'Leave', hintAction: 'cancel' },
+              { id: 'leave', label: 'Leave' },
             ]);
           view.modal.itemId = itemId;
           view.modal.dialogLines = lines;
@@ -146,7 +150,7 @@ export function startGame(canvas, seed, options = {}, initialWorld = null) {
           const label = branchOpt ? branchOpt.label : def.name;
           return { id: qid, label };
         });
-        options.push({ id: 'notnow', label: 'Not now', hintAction: 'cancel' });
+        options.push({ id: 'notnow', label: 'Not now' });
         const flavor = questOfferFlavor(e.quests);
         view.modal = mkModal('offer', 'Sable', flavor, options);
         break;
@@ -279,7 +283,7 @@ export function startGame(canvas, seed, options = {}, initialWorld = null) {
         {
           const items = inventoryItems();
           const options = items.map((it) => ({ id: `use:${it.id}`, label: `${it.name}${it.count > 1 ? ` x${it.count}` : ''}`, usable: it.usable }));
-          options.push({ id: 'close', label: 'Close', hintAction: 'cancel' });
+          options.push({ id: 'close', label: 'Close' });
           view.modal.options = options;
           view.modal.sel = view.modal.sel != null ? Math.min(view.modal.sel, options.length - 1) : null;
         }
