@@ -21,7 +21,7 @@ import { keyHint, withHint } from '../src/app/device-labels.js';
 import { describeObjective } from '../src/app/objective-text.js';
 import { computeVisibility } from '../src/sim/visibility.js';
 
-const GOLDEN_DEMO_FINGERPRINT = 'cb9ff10d';
+const GOLDEN_DEMO_FINGERPRINT = '6409cc16';
 
 const failures = [];
 let count = 0;

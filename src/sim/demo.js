@@ -49,7 +49,8 @@ export function demoCommands() {
   // proving effect-gating (not existence-gating) works before the real one.
   walkTo(12, 8);
   cmds.push({ type: 'ATTUNE', wellId: 'playerwell' }); // well_hint, no effect
-  walkTo(7, 12);
+  // Resonance sits at the far corner of the Reach — the real trek.
+  walkTo(39, 23);
   cmds.push({ type: 'ATTUNE', wellId: 'resonance' }); // real effect: audio on
 
   // Some free-roam combat + a destructible, exercised while wandering.

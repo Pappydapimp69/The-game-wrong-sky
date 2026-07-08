@@ -106,8 +106,11 @@ export const CONTENT = {
       // always-visible flavor text shown when it does NOT (a vague, in-
       // fiction clue, never a flat "nothing here").
       wells: {
+        // Deliberately the FARTHEST well from spawn (3,12) — quest 1 opens
+        // the chapter with a real trek across the whole Reach before any
+        // shortcut/fast-travel exists, rather than a nearby freebie.
         resonance: {
-          x: 7, y: 12, grants: 'audio',
+          x: 39, y: 23, grants: 'audio',
           hint: 'A stream gently trickles into the water. You almost hear it.',
         },
         playerwell: {
@@ -145,7 +148,7 @@ export const CONTENT = {
     ],
     guide: {
       talk: 'A survivor stands nearby. Speak with Sable.',
-      hear: 'A well hums nearby, unheard. Find the one that answers to sound.',
+      hear: 'A well hums somewhere out in the Reach, unheard. Find the one that answers to sound.',
       choose1: 'Sable has a question. Hear her out, then answer.',
       choose2: 'The story isn’t finished. Talk to Sable again.',
       choose3: 'One thread remains. Talk to Sable once more.',
