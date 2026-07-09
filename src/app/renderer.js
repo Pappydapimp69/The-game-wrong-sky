@@ -123,7 +123,15 @@ export function render(ctx, w, view, now = 0) {
   ctx.fillRect(0, 0, W, H);
 
   // --- camera + world scale ------------------------------------------------
-  const scale = H / (16 * TILE);
+  // Fit 16 tiles along the SHORTER screen dimension, not always H. A fixed
+  // H-only fit assumes landscape (W > H, so H is the constraining axis) —
+  // on a mobile portrait screen H is the LARGER raw-pixel dimension (often
+  // taller than any desktop window), so locking 16 tiles to it blew the
+  // scale up and left only a sliver of width on screen. min(W, H) keeps
+  // desktop/landscape behavior identical (H was already the smaller side
+  // there) while giving portrait screens the same tile size and a sane,
+  // wider-than-tall field of view instead of an over-zoomed crop.
+  const scale = Math.min(W, H) / (16 * TILE);
   const regionWpx = w.region.w * TILE, regionHpx = w.region.h * TILE;
   const viewWpx = W / scale, viewHpx = H / scale;
   const centerX = view.px * TILE + TILE / 2, centerY = view.py * TILE + TILE / 2;
