@@ -137,6 +137,10 @@ export function makeInput(canvas) {
     poll,
     setZones(zones) { touchZones = zones; },
     get device() { return device; },
-    hasTouch: 'ontouchstart' in window,
+    // 'ontouchstart' in window alone false-negatives on real touch hardware —
+    // notably iPadOS Safari in its default desktop-site mode, which drops
+    // ontouchstart entirely despite the device being fully touch-capable.
+    // navigator.maxTouchPoints is the more reliable modern signal; check both.
+    hasTouch: 'ontouchstart' in window || (navigator.maxTouchPoints || 0) > 0,
   };
 }
