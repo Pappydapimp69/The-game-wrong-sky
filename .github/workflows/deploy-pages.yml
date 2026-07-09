@@ -29,6 +29,24 @@ jobs:
       - uses: actions/checkout@v4
       - name: Run smoke suite
         run: node scripts/smoke.mjs
+      - name: Cache-bust every ES module import, not just the entry script
+        # index.html only ever versioned its own <script src="src/main.js?v=...">
+        # — every one of the ~24 nested relative imports (game.js importing
+        # input.js, renderer.js, ...) is a SEPARATE browser cache entry keyed
+        # by its own unversioned URL. Bumping the entry script does nothing
+        # for those, so a returning visitor's browser can keep serving a
+        # stale nested module indefinitely even after a fix ships and the
+        # entry script is refetched (see memory/projects/pappydapimp69__
+        # the-game-prologue.md#E8, where this exact gap produced a "still
+        # broken after deploy" report that was actually already fixed in
+        # source). Rewriting every import specifier with the same per-deploy
+        # token here — on the ephemeral deploy artifact only, never the repo
+        # source — closes the gap completely instead of leaving it partial.
+        run: |
+          VER="${{ github.sha }}"
+          grep -rl --include='*.js' -E "from ['\"]\.[^'\"]+\.js['\"]" src/ \
+            | xargs -r sed -i -E "s/(from ['\"][^'\"]+\.js)(['\"])/\1?v=${VER}\2/g"
+          sed -i -E "s#(src=\"src/main\.js)(\?v=[^\"]*)?(\")#\1?v=${VER}\3#" index.html
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:
